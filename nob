@@ -1,0 +1,17 @@
+#!/bin/sh
+
+set -e
+
+mkdir -p out
+
+SRC="nob.kt"
+CLASS="out/NobKt.class"
+KOTLIN_LIB="/opt/homebrew/Cellar/kotlin/2.2.0/libexec/lib"
+
+if [ ! -f "$CLASS" ]; then
+    kotlinc "$SRC" -d out
+fi
+
+# $1 is e.g Main.kt $2 is e.g. -v
+java -cp "out:$KOTLIN_LIB/*" NobKt $@
+
