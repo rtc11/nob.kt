@@ -1,17 +1,18 @@
 import java.io.*
+import java.lang.ProcessBuilder
+import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
-import java.nio.file.Files
 import java.nio.file.attribute.FileTime
-import java.util.*
 import java.time.Instant
+import java.util.*
+import java.util.concurrent.TimeUnit
 import java.util.function.*
-import java.lang.ProcessBuilder
 import org.jetbrains.kotlin.cli.common.arguments.K2JVMCompilerArguments
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSeverity
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSourceLocation
-import org.jetbrains.kotlin.cli.common.messages.PrintingMessageCollector
 import org.jetbrains.kotlin.cli.common.messages.MessageRenderer
+import org.jetbrains.kotlin.cli.common.messages.PrintingMessageCollector
 import org.jetbrains.kotlin.daemon.client.*
 import org.jetbrains.kotlin.daemon.common.*
 
@@ -116,7 +117,7 @@ object Nob {
 
         val daemon_reports = arrayListOf<DaemonReportMessage>()
 
-        val compile_service = KotlinCompilerClient.connectToCompileService(
+        val daemon = KotlinCompilerClient.connectToCompileService(
             compiler_id,
             client_alive_file,
             daemon_jvm_opts,
@@ -127,18 +128,22 @@ object Nob {
 
         var session_id: Int? = null
         try {
-            session_id = compile_service.leaseCompileSession(client_alive_file.absolutePath).get()
+            session_id = daemon.leaseCompileSession(client_alive_file.absolutePath).get()
 
-            return KotlinCompilerClient.compile(
-                compile_service,
+            val start_time = System.nanoTime()
+            val exit_code = KotlinCompilerClient.compile(
+                daemon,
                 session_id,
                 CompileService.TargetPlatform.JVM,
                 args,
                 PrintingMessageCollector(System.err, MessageRenderer.WITHOUT_PATHS, true),
                 reportSeverity = ReportSeverity.DEBUG,
             )
+            val end_time = System.nanoTime()
+            println("[INFO] Compilation complete in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
+            return exit_code
         } finally {
-            session_id?.let { compile_service.releaseCompileSession(it) }
+            session_id?.let { daemon.releaseCompileSession(it) }
         }
     }
 
