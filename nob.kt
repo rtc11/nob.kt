@@ -8,9 +8,6 @@ import java.time.Instant
 import java.util.*
 import java.util.concurrent.TimeUnit
 import java.util.function.*
-import org.jetbrains.kotlin.cli.common.arguments.K2JVMCompilerArguments
-import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSeverity
-import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSourceLocation
 import org.jetbrains.kotlin.cli.common.messages.MessageRenderer
 import org.jetbrains.kotlin.cli.common.messages.PrintingMessageCollector
 import org.jetbrains.kotlin.daemon.client.*
@@ -50,7 +47,7 @@ data class Opts(
     val kotlin_daemon_client: Path = kotlin_lib.resolve("kotlin-daemon-client.jar").normalize(),
     val kotlin_daemon: Path = kotlin_lib.resolve("kotlin-daemon.jar").normalize(),
     val jvm_target: Int = 21,
-    val backend_threads: Int = 2, // run codegen with N thread per processor
+    val backend_threads: Int = 1, // run codegen with N thread per processor
     val verbose: Boolean = false,
     val debug: Boolean = true,
     val error: Boolean = false,
@@ -101,49 +98,50 @@ object Nob {
         )
         val daemon_opts = DaemonOptions(verbose = opts.verbose)
         val daemon_jvm_opts = DaemonJVMOptions()
-        val client_alive_file = File("out/.alive")
-        if (!client_alive_file.exists()) client_alive_file.createNewFile()
-        val args = arrayOf(
-            File(opts.src_file).absolutePath.toString(),
+        val client_alive_file = File("out/.alive").apply { if (!exists()) createNewFile() }
+        val args = mutableListOf(
+            File(opts.src_file).absolutePath,
             "-d", opts.target_dir.toString(),
             "-jvm-target", opts.jvm_target.toString(),
-            "-cp", listOf(
-                opts.kotlin_stdlib.toString(),
-                opts.kotlin_compiler.toString(),
-                opts.kotlin_daemon_client.toString(),
-                opts.kotlin_daemon.toString(),
-            ).joinToString(":"),
+            "-Xbackend-threads", opts.backend_threads.toString(),
+            "-cp", listOf(opts.kotlin_stdlib, opts.kotlin_compiler, opts.kotlin_daemon_client, opts.kotlin_daemon).joinToString(":"),
         )
+        if (opts.verbose) args += "-verbose"
+        if (opts.debug) args += "-Xdebug"
+        if (opts.extra) args += "-Wextra"
+        if (opts.error) args += "-Werror"
 
         val daemon_reports = arrayListOf<DaemonReportMessage>()
 
         val daemon = KotlinCompilerClient.connectToCompileService(
-            compiler_id,
-            client_alive_file,
-            daemon_jvm_opts,
-            daemon_opts,
-            DaemonReportingTargets(out = System.out, messages = daemon_reports),
-            true,
-        ) ?: error("unable to connect to compiler daemon: " + daemon_reports.joinToString("\n  ", prefix = "\n  ") { "${it.category.name} ${it.message}" })
+            compilerId = compiler_id,
+            clientAliveFlagFile = client_alive_file,
+            daemonJVMOptions = daemon_jvm_opts,
+            daemonOptions = daemon_opts,
+            reportingTargets = DaemonReportingTargets(out = System.out, messages = daemon_reports),
+            autostart = true,
+        ) ?: error("unable to connect to compiler daemon: " + 
+            daemon_reports.joinToString("\n  ", prefix = "\n  ") { 
+                "${it.category.name} ${it.message}"
+            })
 
-        var session_id: Int? = null
+        val session_id = daemon.leaseCompileSession(client_alive_file.absolutePath).get()
         try {
-            session_id = daemon.leaseCompileSession(client_alive_file.absolutePath).get()
-
             val start_time = System.nanoTime()
             val exit_code = KotlinCompilerClient.compile(
-                daemon,
-                session_id,
-                CompileService.TargetPlatform.JVM,
-                args,
-                PrintingMessageCollector(System.err, MessageRenderer.WITHOUT_PATHS, true),
+                compilerService = daemon,
+                sessionId = session_id,
+                targetPlatform = CompileService.TargetPlatform.JVM,
+                args = args.toTypedArray(),
+                messageCollector = PrintingMessageCollector(System.err, MessageRenderer.WITHOUT_PATHS, true),
+                compilerMode = CompilerMode.NON_INCREMENTAL_COMPILER,
                 reportSeverity = ReportSeverity.DEBUG,
             )
             val end_time = System.nanoTime()
             println("[INFO] Compilation complete in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
             return exit_code
         } finally {
-            session_id?.let { daemon.releaseCompileSession(it) }
+            daemon.releaseCompileSession(session_id) 
         }
     }
 
