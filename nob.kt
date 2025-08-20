@@ -1,24 +1,41 @@
 import java.io.*
-import java.nio.file.*
-import java.nio.file.attribute.*
+import java.nio.file.Path
+import java.nio.file.Paths
+import java.nio.file.Files
+import java.nio.file.attribute.FileTime
 import java.util.*
+import java.time.Instant
 import java.util.function.*
 import java.lang.ProcessBuilder
+import org.jetbrains.kotlin.cli.common.arguments.K2JVMCompilerArguments
+import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSeverity
+import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSourceLocation
+import org.jetbrains.kotlin.cli.common.messages.PrintingMessageCollector
+import org.jetbrains.kotlin.cli.common.messages.MessageRenderer
+import org.jetbrains.kotlin.daemon.client.*
+import org.jetbrains.kotlin.daemon.common.*
 
+// TODO: save current NobKt.class as temp and revert back on failure
 fun main(args: Array<String>) {
     try {
-        val src_file = args.firstOrNull() ?: "Main.kt".also { println("[INFO] No file specified, assuming $it") }
+        Nob.compile(Opts("nob.kt"))
 
-        Nob.build(Opts("nob.kt"))
+        val src_file = args.firstOrNull() ?: "Main.kt".also { 
+            println("[INFO] No file specified, assuming $it")
+        }
+
         val opts = Opts(src_file)
-        when (args.firstOrNull()) {
-            "debug" -> Nob.build(opts)
+        val exit_code = when (args.getOrNull(0)) {
+            "debug" -> Nob.compile(opts)
             "release" -> Nob.release(opts)
             "clear" -> Nob.clear(opts)
-            else -> Nob.build(opts)
+            else -> Nob.compile(opts)
         }
+
+        System.exit(exit_code)
     } catch (e: Exception) {
-        println("[ERR] build failed with $e")
+        e.printStackTrace()
+        System.exit(1)
     }
 }
 
@@ -26,28 +43,30 @@ data class Opts(
     val src_file: String,
     val java_bin: Path = Paths.get("/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home/bin"),
     val kotlin_bin: Path = Paths.get("/opt/homebrew/bin"),
+    val kotlin_lib: Path = Paths.get("/opt/homebrew/Cellar/kotlin/2.2.0/libexec/lib"),
+    val kotlin_stdlib: Path = kotlin_lib.resolve("kotlin-stdlib.jar").normalize(),
+    val kotlin_compiler: Path = kotlin_lib.resolve("kotlin-compiler.jar").normalize(),
+    val kotlin_daemon_client: Path = kotlin_lib.resolve("kotlin-daemon-client.jar").normalize(),
+    val kotlin_daemon: Path = kotlin_lib.resolve("kotlin-daemon.jar").normalize(),
     val jvm_target: Int = 21,
     val backend_threads: Int = 2, // run codegen with N thread per processor
     val verbose: Boolean = false,
     val debug: Boolean = true,
     val error: Boolean = false,
     val extra: Boolean = true,
+    val use_daemon: Boolean = true,
 ) {
     val name: String = src_file.removeSuffix(".kt").lowercase()
-    val fs: FileSystem = FileSystems.getDefault()
     val cwd: String = System.getProperty("user.dir")
-    val classpath: Path = fs.getPath(cwd)
-    val src: Path = fs.getPath(cwd, src_file).normalize()
-    val src_time: FileTime get() = Files.getLastModifiedTime(src)
-    val target_dir: Path = fs.getPath(cwd, "out")
+    val classpath: Path = Paths.get(cwd)
+    val src: Path = Paths.get(cwd, src_file).normalize()
+    val target_dir: Path = Paths.get(cwd, "out")
     val cls: Path = target_dir.resolve(name.replaceFirstChar{ it.uppercase() } + "Kt.class")
-    val cls_time: FileTime get() = Files.getLastModifiedTime(cls)
-    val main_path: Path = fs.getPath(cwd, src_file) // fs.getPath(cwd, "src", nob.kt"),
+    val main_path: Path = Paths.get(cwd, src_file)
 }
 
 object Nob {
-
-    fun release(opts: Opts) {
+    fun release(opts: Opts): Int {
         val opts = opts.copy(
             debug = false,
             error = true,
@@ -55,22 +74,77 @@ object Nob {
         val cmd = BuildCommand(opts).to_jar()
         if (opts.verbose) println("[INFO] $cmd")
         println("[INFO] package ${opts.name}.jar")
-        run_command(cmd, opts).let(System::exit)
+        return run_command(cmd, opts)
     }
 
-    fun build(opts: Opts) {
-        val cmd = BuildCommand(opts).to_kotlinc()
-        if (opts.src_time.toInstant() > opts.cls_time.toInstant()) {
+    fun compile(opts: Opts): Int {
+        val src_modified = Files.getLastModifiedTime(opts.src).toInstant() 
+        val cls_modified = if (Files.exists(opts.cls)) Files.getLastModifiedTime(opts.cls).toInstant() else Instant.EPOCH
+
+        if (src_modified > cls_modified) {
             println("[INFO] compiling ${opts.name} to ${opts.target_dir}")
-            if (opts.verbose) println("[INFO] $cmd")
-            val status = run_command(cmd, opts)
-            if (status != 0) System.exit(status)
+            return when (opts.use_daemon) {
+                true -> compile_with_daemon(opts) 
+                false -> run_command(BuildCommand(opts).to_kotlinc(), opts)
+            }
+        } 
+        return 0
+    }
+
+    fun compile_with_daemon(opts: Opts): Int {
+        val compiler_id = CompilerId.makeCompilerId(
+            opts.kotlin_stdlib.toFile(),
+            opts.kotlin_compiler.toFile(),
+            opts.kotlin_daemon_client.toFile(),
+            opts.kotlin_daemon.toFile(),
+        )
+        val daemon_opts = DaemonOptions(verbose = opts.verbose)
+        val daemon_jvm_opts = DaemonJVMOptions()
+        val client_alive_file = File("out/.alive")
+        if (!client_alive_file.exists()) client_alive_file.createNewFile()
+        val args = arrayOf(
+            File(opts.src_file).absolutePath.toString(),
+            "-d", opts.target_dir.toString(),
+            "-jvm-target", opts.jvm_target.toString(),
+            "-cp", listOf(
+                opts.kotlin_stdlib.toString(),
+                opts.kotlin_compiler.toString(),
+                opts.kotlin_daemon_client.toString(),
+                opts.kotlin_daemon.toString(),
+            ).joinToString(":"),
+        )
+
+        val daemon_reports = arrayListOf<DaemonReportMessage>()
+
+        val compile_service = KotlinCompilerClient.connectToCompileService(
+            compiler_id,
+            client_alive_file,
+            daemon_jvm_opts,
+            daemon_opts,
+            DaemonReportingTargets(out = System.out, messages = daemon_reports),
+            true,
+        ) ?: error("unable to connect to compiler daemon: " + daemon_reports.joinToString("\n  ", prefix = "\n  ") { "${it.category.name} ${it.message}" })
+
+        var session_id: Int? = null
+        try {
+            session_id = compile_service.leaseCompileSession(client_alive_file.absolutePath).get()
+
+            return KotlinCompilerClient.compile(
+                compile_service,
+                session_id,
+                CompileService.TargetPlatform.JVM,
+                args,
+                PrintingMessageCollector(System.err, MessageRenderer.WITHOUT_PATHS, true),
+                reportSeverity = ReportSeverity.DEBUG,
+            )
+        } finally {
+            session_id?.let { compile_service.releaseCompileSession(it) }
         }
     }
 
-    fun clear(opts: Opts) {
+    fun clear(opts: Opts): Int {
         println("[INFO] clear ${opts.target_dir}")
-        run_command("rm -rf ${opts.target_dir}", opts).let(System::exit)
+        return run_command("rm -rf ${opts.target_dir}", opts)
     }
 
     fun run_command(cmd: String, opts: Opts): Int {
@@ -91,11 +165,10 @@ data class BuildCommand(private val opts: Opts) {
     fun to_kotlinc(): String {
         return """
             "${opts.kotlin_bin.resolve("kotlinc").normalize()}" \
-            -daemon \
             -Xbackend-threads=${opts.backend_threads} \
             -jvm-target ${opts.jvm_target} \
             -d "${opts.target_dir}" \
-            -cp "${opts.classpath}" \
+            -cp "${opts.classpath}:${opts.kotlin_compiler}:${opts.kotlin_stdlib}:${opts.kotlin_daemon_client}:${opts.kotlin_daemon}" \
             ${if(opts.verbose) "-verbose" else ""} \
             ${if(opts.debug) "-Xdebug" else ""} \
             ${if(opts.extra) "-Wextra" else ""} \
