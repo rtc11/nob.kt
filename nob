@@ -5,11 +5,11 @@ set -e
 KOTLIN_LIB="/opt/homebrew/Cellar/kotlin/2.2.0/libexec/lib"
 LIBS="$KOTLIN_LIB/kotlin-stdlib.jar:$KOTLIN_LIB/kotlin-compiler.jar:$KOTLIN_LIB/kotlin-daemon-client.jar:/$KOTLIN_LIB/kotlin-daemon.jar"
 
-mkdir -p out
+mkdir -p out/nob
 
-if [ ! -f out/NobKt.class ]; then
+if [ ! -f out/nob/NobKt.class ]; then
     echo "[INFO] bootstrapping nob.kt -> class files"
-    kotlinc nob.kt -cp "$LIBS" -d out
+    kotlinc nob.kt -cp "$LIBS" -d out/nob
 fi
 
-java -cp "out:$LIBS" NobKt "$@" 
+java -cp "out/nob:$LIBS" NobKt "$@" 

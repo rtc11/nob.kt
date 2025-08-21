@@ -13,63 +13,50 @@ import org.jetbrains.kotlin.cli.common.messages.PrintingMessageCollector
 import org.jetbrains.kotlin.daemon.client.*
 import org.jetbrains.kotlin.daemon.common.*
 
-// TODO: save current NobKt.class as temp and revert back on failure
 fun main(args: Array<String>) {
+    val nob_opts = Opts("nob.kt", out_dir = "out/nob")
+    val opts = Opts(args.firstOrNull() ?: Nob.default_src())
+
     try {
-        Nob.compile(Opts("nob.kt"))
-
-        val src_file = args.firstOrNull() ?: "Main.kt".also { 
-            println("[INFO] No file specified, assuming $it")
-        }
-
-        val opts = Opts(src_file)
-        val exit_code = when (args.getOrNull(0)) {
-            "debug" -> Nob.compile(opts)
-            "release" -> Nob.release(opts)
-            "clear" -> Nob.clear(opts)
-            else -> Nob.compile(opts)
-        }
-
+        Nob.backup(nob_opts)
+        Nob.compile(nob_opts)
+        val exit_code = Nob.compile(opts)
         System.exit(exit_code)
     } catch (e: Exception) {
         e.printStackTrace()
+        Nob.restore(nob_opts)
         System.exit(1)
     }
 }
 
 data class Opts(
     val src_file: String,
-    val java_bin: Path = Paths.get("/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home/bin"),
-    val kotlin_bin: Path = Paths.get("/opt/homebrew/bin"),
     val kotlin_lib: Path = Paths.get("/opt/homebrew/Cellar/kotlin/2.2.0/libexec/lib"),
     val kotlin_stdlib: Path = kotlin_lib.resolve("kotlin-stdlib.jar").normalize(),
     val kotlin_compiler: Path = kotlin_lib.resolve("kotlin-compiler.jar").normalize(),
     val kotlin_daemon_client: Path = kotlin_lib.resolve("kotlin-daemon-client.jar").normalize(),
     val kotlin_daemon: Path = kotlin_lib.resolve("kotlin-daemon.jar").normalize(),
+    val out_dir: String = "out",
     val jvm_target: Int = 21,
-    val backend_threads: Int = 1, // run codegen with N thread per processor
+    val backend_threads: Int = 1, // run codegen with N thread per processor (Default 1)
     val verbose: Boolean = false,
     val debug: Boolean = true,
     val error: Boolean = false,
     val extra: Boolean = true,
-    val use_daemon: Boolean = true,
 ) {
     val name: String = src_file.removeSuffix(".kt").lowercase()
     val cwd: String = System.getProperty("user.dir")
     val classpath: Path = Paths.get(cwd)
     val src: Path = Paths.get(cwd, src_file).normalize()
-    val target_dir: Path = Paths.get(cwd, "out")
+    val target_dir: Path = Paths.get(cwd, out_dir).also { it.toFile().mkdirs() }
     val cls: Path = target_dir.resolve(name.replaceFirstChar{ it.uppercase() } + "Kt.class")
     val main_path: Path = Paths.get(cwd, src_file)
 }
 
 object Nob {
     fun release(opts: Opts): Int {
-        val opts = opts.copy(
-            debug = false,
-            error = true,
-        )
-        val cmd = BuildCommand(opts).to_jar()
+        val opts = opts.copy(debug = false, error = true)
+        val cmd = jar_command(opts)
         if (opts.verbose) println("[INFO] $cmd")
         println("[INFO] package ${opts.name}.jar")
         return run_command(cmd, opts)
@@ -81,12 +68,31 @@ object Nob {
 
         if (src_modified > cls_modified) {
             println("[INFO] compiling ${opts.name} to ${opts.target_dir}")
-            return when (opts.use_daemon) {
-                true -> compile_with_daemon(opts) 
-                false -> run_command(BuildCommand(opts).to_kotlinc(), opts)
-            }
+            compile_with_daemon(opts) 
         } 
         return 0
+    }
+
+    fun backup(opts: Opts) {
+        val cls = opts.cls.toFile()
+        if (cls.exists()) {
+            println("[INFO] backup ${opts.cls}")
+            val backup = File(cls.parentFile, cls.name + ".bak")
+            cls.copyTo(backup, overwrite = true)
+        }
+    }
+
+    fun restore(opts: Opts) {
+        val cls = opts.cls.toFile()
+        val backup = File(cls.parentFile, opts.name + ".bak")
+        if (backup.exists()) {
+            println("[INFO] restoring ${opts.cls}")
+            backup.copyTo(cls, overwrite = true) 
+        }
+    }
+
+    fun default_src(): String = "Main.kt".also {
+        println("[INFO] No src file specified, using $it")
     }
 
     fun compile_with_daemon(opts: Opts): Int {
@@ -98,12 +104,12 @@ object Nob {
         )
         val daemon_opts = DaemonOptions(verbose = opts.verbose)
         val daemon_jvm_opts = DaemonJVMOptions()
-        val client_alive_file = File("out/.alive").apply { if (!exists()) createNewFile() }
+        val client_alive_file = File("${opts.out_dir}/.alive").apply { if (!exists()) createNewFile() }
         val args = mutableListOf(
             File(opts.src_file).absolutePath,
             "-d", opts.target_dir.toString(),
             "-jvm-target", opts.jvm_target.toString(),
-            "-Xbackend-threads", opts.backend_threads.toString(),
+            "-Xbackend-threads=${opts.backend_threads}",
             "-cp", listOf(opts.kotlin_stdlib, opts.kotlin_compiler, opts.kotlin_daemon_client, opts.kotlin_daemon).joinToString(":"),
         )
         if (opts.verbose) args += "-verbose"
@@ -135,7 +141,7 @@ object Nob {
                 args = args.toTypedArray(),
                 messageCollector = PrintingMessageCollector(System.err, MessageRenderer.WITHOUT_PATHS, true),
                 compilerMode = CompilerMode.NON_INCREMENTAL_COMPILER,
-                reportSeverity = ReportSeverity.DEBUG,
+                reportSeverity = ReportSeverity.INFO,
             )
             val end_time = System.nanoTime()
             println("[INFO] Compilation complete in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
@@ -164,26 +170,6 @@ object Nob {
     }
 }
 
-data class BuildCommand(private val opts: Opts) {
-    fun to_kotlinc(): String {
-        return """
-            "${opts.kotlin_bin.resolve("kotlinc").normalize()}" \
-            -Xbackend-threads=${opts.backend_threads} \
-            -jvm-target ${opts.jvm_target} \
-            -d "${opts.target_dir}" \
-            -cp "${opts.classpath}:${opts.kotlin_compiler}:${opts.kotlin_stdlib}:${opts.kotlin_daemon_client}:${opts.kotlin_daemon}" \
-            ${if(opts.verbose) "-verbose" else ""} \
-            ${if(opts.debug) "-Xdebug" else ""} \
-            ${if(opts.extra) "-Wextra" else ""} \
-            ${if(opts.error) "-Werror" else ""} \
-            "${opts.main_path}"
-        """.trimIndent()
-    }
-
-    fun to_jar(): String { 
-        return """
-            jar cfe ${opts.name}.jar ${opts.name}Kt \
-            -C "${opts.target_dir}" .
-        """.trimIndent()
-    }
+fun jar_command(opts: Opts): String {
+    return """jar cfe ${opts.name}.jar ${opts.name}Kt -C "${opts.target_dir}" ."""
 }
