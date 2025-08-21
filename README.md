@@ -1,23 +1,18 @@
 # nob.kt - NoBuild for Kotlin
-This is inspired by the header only library version for C [https://tsoding/nob.h](https://github.com/tsoding/nob.h)
+This is inspired by the header only library version for C [https://github.com/tsoding/nob.h](https://github.com/tsoding/nob.h)
 
-The idea is to build Kotlin files only with the use of Kotlin it self. 
-You only need to install the Kotlin compiler.
+Build kotlin files only with kotlin.
+This no-build library rebuild it self if changed and uses a Kotlin daemon for speeding up the compilation times.
 
-# Setup
-`nob.kt` contains the source code that can compile Kotlin files.
+`nob.kt` contains the source code of the library.
 
-`nob` is a bootstrap shell-script for ease, but its not necessary, you can do this manually.
-If using the shell script `nob`, make sure its pointing to the correct KOTLIN_LIB path.
-This also assumes you have the binaries for kotlinc and java available.
+`nob` is a bootstrap and entrypoint shell script for nob and your kotlin source files.
+Make sure the KOTLIN_LIB path is correct.
 
 # Usage
-Bootstrap nob and compile Main.kt:
+Bootstrap nob for the first time, and compile Main.kt
 > ./nob Main.kt
 
-Compile Main.kt:
-> ./nob Main.kt
-
-Compile nob.kt:
+Compile changes in nob.kt or Main.kt
 > ./nob Main.kt
 
