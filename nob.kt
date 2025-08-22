@@ -1,5 +1,6 @@
 import java.io.*
 import java.lang.ProcessBuilder
+import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
@@ -8,6 +9,7 @@ import java.time.Instant
 import java.util.*
 import java.util.concurrent.TimeUnit
 import java.util.function.*
+import javax.xml.parsers.DocumentBuilderFactory
 import org.jetbrains.kotlin.cli.common.messages.MessageRenderer
 import org.jetbrains.kotlin.cli.common.messages.PrintingMessageCollector
 import org.jetbrains.kotlin.daemon.client.*
@@ -20,6 +22,10 @@ fun main(args: Array<String>) {
     try {
         Nob.backup(nob_opts)
         Nob.compile(nob_opts)
+        // val dep = Dep.of("org.apache.commons:commons-lang3:3.14.0")
+        // val all = DepResolution.resolve_transitive(dep)
+        // println("[INFO] resolved dependencies:")
+        // all.forEach { println("[INFO] $it") }
         val exit_code = Nob.compile(opts)
         System.exit(exit_code)
     } catch (e: Exception) {
@@ -51,12 +57,16 @@ data class Opts(
     val target_dir: Path = Paths.get(cwd, out_dir).also { it.toFile().mkdirs() }
     val cls: Path = target_dir.resolve(name.replaceFirstChar{ it.uppercase() } + "Kt.class")
     val main_path: Path = Paths.get(cwd, src_file)
+
+    fun jar_command(): String {
+        return """jar cfe ${name}.jar ${name}Kt -C "$target_dir" ."""
+    }
 }
 
 object Nob {
     fun release(opts: Opts): Int {
         val opts = opts.copy(debug = false, error = true)
-        val cmd = jar_command(opts)
+        val cmd = opts.jar_command()
         if (opts.verbose) println("[INFO] $cmd")
         println("[INFO] package ${opts.name}.jar")
         return run_command(cmd, opts)
@@ -170,6 +180,121 @@ object Nob {
     }
 }
 
-fun jar_command(opts: Opts): String {
-    return """jar cfe ${opts.name}.jar ${opts.name}Kt -C "${opts.target_dir}" ."""
+data class Dep(
+    val group_id: String,
+    val artifact_id: String,
+    val version: String,
+    val repo: String = "https://repo1.maven.org/maven2",
+) {
+    val base_url = "$repo/${group_id.replace('.', '/')}/$artifact_id" 
+    val pom_url = "$base_url/$version/$artifact_id-$version.pom"
+    val jar_url = "$base_url/$version/$artifact_id-$version.jar"
+    override fun toString() = "$group_id:$artifact_id:$version"
+    companion object {
+        fun of(str: String) = str.split(':').let { Dep(it[0], it[1], it[2]) }
+    }
+}
+
+object DepResolution {
+
+    fun download(dep: Dep): List<Dep> {
+        val url = dep.pom_url
+        println("[INFO] fetching $url")
+        val stream = URI(url).toURL().openStream()
+        val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(stream)
+        doc.documentElement.normalize()
+        val props = parse_props(doc) + builtin_props(doc, dep)
+        val deps = mutableListOf<Dep>()
+        val dep_nodes = doc.getElementsByTagName("dependency")
+        for (i in 0 until dep_nodes.length) {
+            val node = dep_nodes.item(i) as org.w3c.dom.Element 
+            val version_node = node.getElementsByTagName("version")
+            if (version_node.length == 0) continue // managed elsewhere
+            val group_id = node.getElementsByTagName("groupId").item(0).textContent
+            val artifact_id = node.getElementsByTagName("artifactId").item(0).textContent
+            var version = version_node.item(0).textContent
+            version = version.replace(Regex("""\$\{(.+?)}""")) { match -> 
+                val prop_name = match.groupValues[1]
+                props[prop_name] ?: error("unknown property $prop_name in $dep among $props")
+            }
+            if (version.contains('[') || version.contains('(')) {
+                version = resolve_version_range(Dep(group_id, artifact_id, version))
+            }
+            deps.add(Dep(group_id, artifact_id, version))
+        }
+        return deps
+    }
+
+    fun resolve_transitive(dep: Dep, seen: MutableSet<Dep> = mutableSetOf()): Set<Dep> {
+        if (!seen.add(dep)) return seen
+        val deps = try {
+            download(dep)
+        } catch (e: FileNotFoundException) {
+            println("[WARN] $dep not found. Skipping...")
+            emptyList()
+        }
+        for (dep in deps) resolve_transitive(dep, seen)
+        return seen
+    }
+
+    fun parse_props(doc: org.w3c.dom.Document): Map<String, String> {
+        val props = mutableMapOf<String, String>()
+        val xpath = javax.xml.xpath.XPathFactory.newInstance().newXPath()
+        val expr = xpath.compile("/project/properties/*")
+        val nodes = expr.evaluate(doc, javax.xml.xpath.XPathConstants.NODESET) as org.w3c.dom.NodeList
+        for (i in 0 until nodes.length) {
+            val node = nodes.item(i) as org.w3c.dom.Element
+            props[node.tagName] = node.textContent.trim()
+        }
+        return props
+    }
+
+    fun builtin_props(doc: org.w3c.dom.Document, dep: Dep): Map<String, String> {
+        val project_node = doc.getElementsByTagName("project").item(0) as org.w3c.dom.Element
+        val group_id = project_node.getElementsByTagName("groupId").item(0)?.textContent ?: dep.group_id
+        val artifact_id = project_node.getElementsByTagName("artifactId").item(0)?.textContent ?: dep.artifact_id
+        val version = project_node.getElementsByTagName("version").item(0)?.textContent ?: dep.version
+        return mapOf(
+            "project.groupId" to group_id, 
+            "project.artifactId" to artifact_id, 
+            "project.version" to version, 
+            "pom.groupId" to group_id,
+            "pom.artifactId" to artifact_id,
+            "pom.version" to version,
+        )
+    }
+
+    fun resolve_version_range(dep: Dep): String {
+        if(!dep.version.contains('[') && !dep.version.contains('(')) return dep.version
+        val url = "${dep.base_url}/maven-metadata.xml"
+        val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(URI(url).toURL().openStream())
+        doc.documentElement.normalize()
+        val versions = mutableListOf<String>()
+        val nodes = doc.getElementsByTagName("version")
+        for (i in 0 until nodes.length) versions.add(nodes.item(i).textContent)
+        if (versions.isEmpty()) error("no versions found in $url")
+        val range_regex = Regex("""([\[\(])\s*([\d\.\-]+)?\s*,\s*([\d\.\-]+)?\s*([\]\)])""")
+        val match = range_regex.matchEntire(dep.version) ?: error("invalid range: ${dep.version}")
+        val lower_inc = match.groupValues[1] == "["
+        val upper_inc = match.groupValues[4] == "]"
+        val lower_bound = match.groupValues[2].takeIf { it.isNotEmpty() }
+        val upper_bound = match.groupValues[3].takeIf { it.isNotEmpty() }
+        val compatible = versions.filter { 
+            (lower_bound == null || compare(it, lower_bound) > if (lower_inc) -1 else 0) && 
+            (upper_bound == null || compare(it, upper_bound) < if (upper_inc) 1 else 0)
+        }
+        if (compatible.isEmpty()) error("no version satisfies range ${dep.version}")
+        return compatible.maxWithOrNull(::compare)!!
+    }
+    private fun compare(version1: String, version2: String): Int {
+        val parts1 = version1.split(".", "-")
+        val parts2 = version2.split(".", "-")
+        val len = maxOf(parts1.size, parts2.size)
+        for (i in 0 until len) {
+            val p1 = parts1.getOrElse(i) { "0" }.toIntOrNull() ?: 0
+            val p2 = parts2.getOrElse(i) { "0" }.toIntOrNull() ?: 0
+            if (p1 != p2) return p1 - p2
+        }
+        return 0
+    }
 }
