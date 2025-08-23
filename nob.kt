@@ -185,45 +185,20 @@ data class Dep(
     val artifact_id: String,
     val version: String,
     val repo: String = "https://repo1.maven.org/maven2",
+    val type: String = "jar",
+    val scope: String = "compile",
 ) {
     val base_url = "$repo/${group_id.replace('.', '/')}/$artifact_id" 
     val pom_url = "$base_url/$version/$artifact_id-$version.pom"
     val jar_url = "$base_url/$version/$artifact_id-$version.jar"
     override fun toString() = "$group_id:$artifact_id:$version"
     companion object {
-        fun of(str: String) = str.split(':').let { Dep(it[0], it[1], it[2]) }
+        fun of(str: String) = str.split(':').let { Dep(it[0], it[1], it[2], type = it.getOrElse(3) { "compile" }) }
     }
 }
 
 object DepResolution {
-
-    fun download(dep: Dep): List<Dep> {
-        val url = dep.pom_url
-        println("[INFO] fetching $url")
-        val stream = URI(url).toURL().openStream()
-        val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(stream)
-        doc.documentElement.normalize()
-        val props = parse_props(doc) + builtin_props(doc, dep)
-        val deps = mutableListOf<Dep>()
-        val dep_nodes = doc.getElementsByTagName("dependency")
-        for (i in 0 until dep_nodes.length) {
-            val node = dep_nodes.item(i) as org.w3c.dom.Element 
-            val version_node = node.getElementsByTagName("version")
-            if (version_node.length == 0) continue // managed elsewhere
-            val group_id = node.getElementsByTagName("groupId").item(0).textContent
-            val artifact_id = node.getElementsByTagName("artifactId").item(0).textContent
-            var version = version_node.item(0).textContent
-            version = version.replace(Regex("""\$\{(.+?)}""")) { match -> 
-                val prop_name = match.groupValues[1]
-                props[prop_name] ?: error("unknown property $prop_name in $dep among $props")
-            }
-            if (version.contains('[') || version.contains('(')) {
-                version = resolve_version_range(Dep(group_id, artifact_id, version))
-            }
-            deps.add(Dep(group_id, artifact_id, version))
-        }
-        return deps
-    }
+    private val pom_cache = mutableMapOf<String, org.w3c.dom.Document>()
 
     fun resolve_transitive(dep: Dep, seen: MutableSet<Dep> = mutableSetOf()): Set<Dep> {
         if (!seen.add(dep)) return seen
@@ -233,68 +208,271 @@ object DepResolution {
             println("[WARN] $dep not found. Skipping...")
             emptyList()
         }
-        for (dep in deps) resolve_transitive(dep, seen)
+        for (dep in deps) {
+            if (dep.scope in listOf("test", "provided")) continue
+            resolve_transitive(dep, seen)
+
+        }
         return seen
     }
 
-    fun parse_props(doc: org.w3c.dom.Document): Map<String, String> {
-        val props = mutableMapOf<String, String>()
-        val xpath = javax.xml.xpath.XPathFactory.newInstance().newXPath()
-        val expr = xpath.compile("/project/properties/*")
-        val nodes = expr.evaluate(doc, javax.xml.xpath.XPathConstants.NODESET) as org.w3c.dom.NodeList
-        for (i in 0 until nodes.length) {
-            val node = nodes.item(i) as org.w3c.dom.Element
-            props[node.tagName] = node.textContent.trim()
+    fun download(dep: Dep): List<Dep> {
+        val doc = try {
+            download_pom(dep)
+        } catch (e: Exception) {
+            println("[WARN] $dep not found. Skipping...")
+            return emptyList()
         }
-        return props
+        val props = Properties.collect(doc, dep)
+        val managed = collect_managed_versions(doc, dep).toMutableMap()
+        val deps = mutableListOf<Dep>()
+        val dep_nodes = doc.getElementsByTagName("dependency")
+        for (i in 0 until dep_nodes.length) {
+            val node = dep_nodes.item(i) as org.w3c.dom.Element 
+            val group_id = node.getElementsByTagName("groupId").item(0).textContent
+            val artifact_id = node.getElementsByTagName("artifactId").item(0).textContent
+            val version_node = node.getElementsByTagName("version")
+            // resolve version: explicit > managed > skip optional
+            var version = if (version_node.length > 0) {
+                version_node.item(0).textContent.trim()
+            } else {
+                managed[group_id to artifact_id]
+                    ?.also { println("[INFO] using managed version for $group_id:$artifact_id") }
+                    ?: run { println("[WARN] no version for $group_id:$artifact_id (not managed), skipping."); continue }
+            }
+            // resolve properties in version
+            version = version.replace(Regex("""\$\{(.+?)}""")) { match ->
+                val prop_name = match.groupValues[1]
+                props[prop_name] ?: run {
+                    println("[WARN] unknown property $prop_name in $dep, skipping dependency $group_id:$artifact_id")
+                    "" // return dummy value to satisfy the lambda
+                }
+            }
+            if (version.isEmpty()) continue // skip dependency if versino could not be resolved
+            // resolve version ranges
+            if (version.contains('[') || version.contains('(')) {
+                version = Versioning.resolve_range(Dep(group_id, artifact_id, version))
+            }
+            val type_node = node.getElementsByTagName("type")
+            val type = if (type_node.length > 0) {
+                type_node.item(0).textContent.trim().replace(Regex("""\$\{(.+?)}""")) { match ->
+                    val prop_name = match.groupValues[1]
+                    props[prop_name] ?: error("unknown property $prop_name for type in $dep")
+                }
+            } else "jar"
+            val scope_node = node.getElementsByTagName("scope")
+            val scope = if (scope_node.length > 0) {
+                scope_node.item(0).textContent.trim().replace(Regex("""\$\{(.+?)}""")) { match ->
+                    val prop_name = match.groupValues[1]
+                    props[prop_name] ?: error("unknown property $prop_name for scope in $dep")
+                }
+            } else "compile"
+            deps.add(Dep(group_id, artifact_id, version, type = type, scope = scope))
+        }
+        return deps
     }
 
-    fun builtin_props(doc: org.w3c.dom.Document, dep: Dep): Map<String, String> {
-        val project_node = doc.getElementsByTagName("project").item(0) as org.w3c.dom.Element
-        val group_id = project_node.getElementsByTagName("groupId").item(0)?.textContent ?: dep.group_id
-        val artifact_id = project_node.getElementsByTagName("artifactId").item(0)?.textContent ?: dep.artifact_id
-        val version = project_node.getElementsByTagName("version").item(0)?.textContent ?: dep.version
-        return mapOf(
-            "project.groupId" to group_id, 
-            "project.artifactId" to artifact_id, 
-            "project.version" to version, 
-            "pom.groupId" to group_id,
-            "pom.artifactId" to artifact_id,
-            "pom.version" to version,
-        )
-    }
-
-    fun resolve_version_range(dep: Dep): String {
-        if(!dep.version.contains('[') && !dep.version.contains('(')) return dep.version
-        val url = "${dep.base_url}/maven-metadata.xml"
-        val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(URI(url).toURL().openStream())
+    private val common_problematic_html_entities = mapOf(
+        "&oslash;" to "ø", "&Oslash;" to "Ø", "&auml;" to "ä", "&ouml;" to "ö", "&uuml;" to "ü", "&Auml;" to "Ä",
+        "&Ouml;" to "Ö", "&Uuml;" to "Ü", "&amp;" to "&", "&lt;" to "<", "&gt;" to ">", "&quot;" to "\"", "&apos;" to "'"
+    )
+    fun download_pom(dep: Dep): org.w3c.dom.Document {
+        pom_cache[dep.toString()]?.let { return it }
+        println("[INFO] fetching ${dep.pom_url}")
+        val stream = URI(dep.pom_url).toURL().openStream()
+        val text = stream.bufferedReader().use { it.readText() }
+        val fixed_text = common_problematic_html_entities.entries.fold(text) { acc, (k, v) -> acc.replace(k, v) }
+        val factory = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }
+        val doc = factory.newDocumentBuilder().parse(fixed_text.byteInputStream())
         doc.documentElement.normalize()
-        val versions = mutableListOf<String>()
-        val nodes = doc.getElementsByTagName("version")
-        for (i in 0 until nodes.length) versions.add(nodes.item(i).textContent)
-        if (versions.isEmpty()) error("no versions found in $url")
-        val range_regex = Regex("""([\[\(])\s*([\d\.\-]+)?\s*,\s*([\d\.\-]+)?\s*([\]\)])""")
-        val match = range_regex.matchEntire(dep.version) ?: error("invalid range: ${dep.version}")
-        val lower_inc = match.groupValues[1] == "["
-        val upper_inc = match.groupValues[4] == "]"
-        val lower_bound = match.groupValues[2].takeIf { it.isNotEmpty() }
-        val upper_bound = match.groupValues[3].takeIf { it.isNotEmpty() }
-        val compatible = versions.filter { 
-            (lower_bound == null || compare(it, lower_bound) > if (lower_inc) -1 else 0) && 
-            (upper_bound == null || compare(it, upper_bound) < if (upper_inc) 1 else 0)
-        }
-        if (compatible.isEmpty()) error("no version satisfies range ${dep.version}")
-        return compatible.maxWithOrNull(::compare)!!
+        pom_cache[dep.toString()] = doc
+        return doc
+    } 
+
+    fun parse_parent(doc: org.w3c.dom.Document): Dep? {
+        val parent_nodes = doc.getElementsByTagName("parent")
+        if (parent_nodes.length == 0) return null
+        val parent = parent_nodes.item(0) as org.w3c.dom.Element
+        val group_id = parent.getElementsByTagName("groupId").item(0).textContent
+        val artifact_id = parent.getElementsByTagName("artifactId").item(0).textContent
+        val version = parent.getElementsByTagName("version").item(0).textContent
+        return Dep(group_id, artifact_id, version)
     }
-    private fun compare(version1: String, version2: String): Int {
-        val parts1 = version1.split(".", "-")
-        val parts2 = version2.split(".", "-")
-        val len = maxOf(parts1.size, parts2.size)
-        for (i in 0 until len) {
-            val p1 = parts1.getOrElse(i) { "0" }.toIntOrNull() ?: 0
-            val p2 = parts2.getOrElse(i) { "0" }.toIntOrNull() ?: 0
-            if (p1 != p2) return p1 - p2
+
+    fun collect_managed_versions(
+        doc: org.w3c.dom.Document,
+        dep: Dep,
+        props: Map<String, String>? = null,
+    ): Map<Pair<String, String>, String> {
+        // parent-managed versions
+        val props_map = props ?: Properties.collect(doc, dep)
+        val parent_managed = parse_parent(doc)?.let {
+            val parent_doc = download_pom(it)
+            val parent_props = Properties.collect(parent_doc, it)
+            collect_managed_versions(parent_doc, it, parent_props)
+        } ?: emptyMap()
+
+        val managed = mutableMapOf<Pair<String, String>, String>()
+
+        // dependency-managed versions
+        val dm_nodes = doc.getElementsByTagName("dependencyManagement")
+        if (dm_nodes.length > 0) {
+            val deps = (dm_nodes.item(0) as org.w3c.dom.Element).getElementsByTagName("dependency")
+            for (i in 0 until deps.length) {
+                val node = deps.item(i) as org.w3c.dom.Element
+                val group_id = node.getElementsByTagName("groupId").item(0).textContent
+                val artifact_id = node.getElementsByTagName("artifactId").item(0).textContent
+                var version = node.getElementsByTagName("version").item(0)?.textContent?.trim()
+                // resolve properties in version
+                if (version != null) {
+                    val unresolved = Regex("""\$\{(.+?)}""").findAll(version).map { it.groupValues[1] }
+                        .filter { it !in props_map }
+                        .toList()
+                    if (unresolved.isNotEmpty()) {
+                        println("[WARN] unknown properties ${unresolved.joinToString()} in $dep, skipping dependency")
+                        continue // skip this dependency entirely
+                    }
+                    version = version.replace(Regex("""\$\{(.+?)}""")) { match ->
+                        val prop_name = match.groupValues[1]
+                        props_map[prop_name]!!
+                    }
+                }
+                val type = node.getElementsByTagName("type").item(0)?.textContent ?: ""
+                val scope = node.getElementsByTagName("scope").item(0)?.textContent ?: ""
+                // handle BOM imports
+                if (type == "pom" && scope == "import" && version != null) {
+                    val bom_dep = Dep(group_id, artifact_id, version)
+                    val bom_doc = try {
+                        download_pom(bom_dep)
+                    } catch (e: Exception) {
+                        println("[WARN] failed to download BOM $bom_dep: ${e.message}, skipping")
+                        continue;
+                    }
+                    val bom_props = Properties.collect(bom_doc, bom_dep)
+                    managed.putAll(collect_managed_versions(bom_doc, bom_dep, bom_props))
+                    continue // skip adding BOM as a regular dependency
+                }
+                if (version != null) {
+                    managed[group_id to artifact_id] = version
+                }
+            }
         }
-        return 0
+        return parent_managed + managed
+    }
+
+    private object Properties {
+        fun parse(doc: org.w3c.dom.Document): Map<String, String> {
+            val props = mutableMapOf<String, String>()
+            val xpath = javax.xml.xpath.XPathFactory.newInstance().newXPath()
+            val expr = xpath.compile("/project/properties/*")
+            val nodes = expr.evaluate(doc, javax.xml.xpath.XPathConstants.NODESET) as org.w3c.dom.NodeList
+            for (i in 0 until nodes.length) {
+                val node = nodes.item(i) as org.w3c.dom.Element
+                props[node.tagName] = node.textContent.trim()
+            }
+            return props
+        }
+
+        fun builtins(doc: org.w3c.dom.Document, dep: Dep): Map<String, String> {
+            val project_node = doc.getElementsByTagName("project").item(0) as org.w3c.dom.Element
+            val group_id = project_node.getElementsByTagName("groupId").item(0)?.textContent ?: dep.group_id
+            val artifact_id = project_node.getElementsByTagName("artifactId").item(0)?.textContent ?: dep.artifact_id
+            val version = project_node.getElementsByTagName("version").item(0)?.textContent ?: dep.version
+            return mapOf(
+                "project.groupId" to group_id, 
+                "project.artifactId" to artifact_id, 
+                "project.version" to version, 
+                "pom.groupId" to group_id,
+                "pom.artifactId" to artifact_id,
+                "pom.version" to version,
+            )
+        }
+
+        fun collect(doc: org.w3c.dom.Document, dep: Dep): Map<String, String> {
+            val parent_props = parse_parent(doc)?.let { Properties.collect(download_pom(it), it) } ?: emptyMap()
+            return parent_props + Properties.parse(doc) + Properties.builtins(doc, dep)
+        }
+    }
+
+    private object Versioning {
+
+        fun resolve(raw: String, props: Map<String, String>): String =
+            raw.replace(Regex("""\$\{(.+?)}""")) { match ->
+                val prop_name = match.groupValues[1]
+                props[prop_name] ?: error("unknown property $prop_name among $props")
+            }
+
+        fun resolve_range(dep: Dep): String {
+            if(!dep.version.contains('[') && !dep.version.contains('(')) return dep.version
+            val url = "${dep.base_url}/maven-metadata.xml"
+            val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(URI(url).toURL().openStream())
+            doc.documentElement.normalize()
+            val versions = mutableListOf<String>()
+            val nodes = doc.getElementsByTagName("version")
+            for (i in 0 until nodes.length) versions.add(nodes.item(i).textContent)
+            if (versions.isEmpty()) error("no versions found in $url")
+            val range_regex = Regex("""([\[\(])\s*([^,]*)?\s*,\s*([^,]*)?\s*([\]\)])""")
+            val match = range_regex.matchEntire(dep.version) ?: error("invalid range: ${dep.version}")
+            val lower_inc = match.groupValues[1] == "["
+            val upper_inc = match.groupValues[4] == "]"
+            val lower_bound = match.groupValues[2].takeIf { it.isNotEmpty() }
+            val upper_bound = match.groupValues[3].takeIf { it.isNotEmpty() }
+            val compatible = versions.filter { 
+                (lower_bound == null || compare(it, lower_bound) > if (lower_inc) -1 else 0) && 
+                (upper_bound == null || compare(it, upper_bound) < if (upper_inc) 1 else 0)
+            }
+            if (compatible.isEmpty()) error("no version satisfies range ${dep.version}")
+            val releases = compatible.filterNot { it.contains("snapshot", ignoreCase = true )}
+            return (releases.ifEmpty { compatible }).maxWithOrNull(::compare)!!
+        }
+
+        fun compare(version1: String, version2: String): Int {
+            val parts1 = tokenize(version1.lowercase())
+            val parts2 = tokenize(version2.lowercase())
+            val len = maxOf(parts1.size, parts2.size)
+            for (i in 0 until len) {
+                val p1 = parts1.getOrElse(i) { Item("", ItemType.Str) }
+                val p2 = parts2.getOrElse(i) { Item("", ItemType.Str) }
+                val cmp = p1.compareTo(p2)
+                if (cmp != 0) return cmp
+            }
+            return 0
+        }
+
+        private enum class ItemType { Int, Str }
+        private data class Item(val value: String, val type: ItemType): Comparable<Item> {
+            override fun compareTo(other: Item): Int = when {
+                this.type == ItemType.Int && other.type == ItemType.Int -> this.value.toBigInteger().compareTo(other.value.toBigInteger())
+                this.type == ItemType.Int -> 1
+                other.type == ItemType.Int -> -1
+                else -> qualifier_compare(this.value, other.value)
+            }
+        }
+        fun tokenize(version: String): List<Item> = version
+            .split('.', '-', '_')
+            .filter { it.isNotEmpty() }
+            .map { it.toBigIntegerOrNull()?.let { num -> Item(num.toString(), ItemType.Int) } ?: Item(it, ItemType.Str) }
+
+        private val QUALIFIERS = listOf(
+            "alpha", "a",
+            "beta", "b",
+            "milestone", "m",
+            "rc", "cr",
+            "snapshot",
+            "sp",
+            "", // empty qualifier = GA release = highest
+        )
+
+        fun qualifier_compare(q1: String, q2: String): Int {
+            if (q1 == q2) return 0
+            val i1 = QUALIFIERS.indexOf(q1)
+            val i2 = QUALIFIERS.indexOf(q2)
+            return when {
+                i1 >= 0 && i2 >= 0 -> i1.compareTo(i2)
+                i1 >= 0 -> -1
+                i2 >= 0 -> 1
+                else -> q1.compareTo(q2)
+            }
+        }
     }
 }
