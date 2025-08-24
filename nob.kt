@@ -16,16 +16,17 @@ import org.jetbrains.kotlin.daemon.client.*
 import org.jetbrains.kotlin.daemon.common.*
 
 fun main(args: Array<String>) {
-    val nob_opts = Opts("nob.kt", out_dir = "out/nob")
-    val opts = Opts(args.firstOrNull() ?: Nob.default_src())
+    val kotlin_libs = args.get(0).split(':').map(Paths::get)
+    val nob_opts = Opts("nob.kt", kotlin_libs, out_dir = "out/nob")
+    val opts = Opts(args.getOrNull(1) ?: Nob.default_src(), kotlin_libs)
 
     try {
         Nob.backup(nob_opts)
         Nob.compile(nob_opts)
-        // val dep = Dep.of("org.apache.commons:commons-lang3:3.14.0")
-        // val all = DepResolution.resolve_transitive(dep)
-        // println("[INFO] resolved dependencies:")
-        // all.forEach { println("[INFO] $it") }
+        val dep = Dep.of("org.apache.commons:commons-lang3:3.14.0")
+        val all = DepResolution.resolve_transitive(dep)
+        println("[INFO] resolved dependencies:")
+        all.forEach { println("[INFO] $it") }
         val exit_code = Nob.compile(opts)
         System.exit(exit_code)
     } catch (e: Exception) {
@@ -37,11 +38,7 @@ fun main(args: Array<String>) {
 
 data class Opts(
     val src_file: String,
-    val kotlin_lib: Path = Paths.get("/opt/homebrew/Cellar/kotlin/2.2.0/libexec/lib"),
-    val kotlin_stdlib: Path = kotlin_lib.resolve("kotlin-stdlib.jar").normalize(),
-    val kotlin_compiler: Path = kotlin_lib.resolve("kotlin-compiler.jar").normalize(),
-    val kotlin_daemon_client: Path = kotlin_lib.resolve("kotlin-daemon-client.jar").normalize(),
-    val kotlin_daemon: Path = kotlin_lib.resolve("kotlin-daemon.jar").normalize(),
+    val kotlin_libs: List<Path>, 
     val out_dir: String = "out",
     val jvm_target: Int = 21,
     val backend_threads: Int = 1, // run codegen with N thread per processor (Default 1)
@@ -106,12 +103,7 @@ object Nob {
     }
 
     fun compile_with_daemon(opts: Opts): Int {
-        val compiler_id = CompilerId.makeCompilerId(
-            opts.kotlin_stdlib.toFile(),
-            opts.kotlin_compiler.toFile(),
-            opts.kotlin_daemon_client.toFile(),
-            opts.kotlin_daemon.toFile(),
-        )
+        val compiler_id = CompilerId.makeCompilerId(opts.kotlin_libs.map { it.toFile() })
         val daemon_opts = DaemonOptions(verbose = opts.verbose)
         val daemon_jvm_opts = DaemonJVMOptions()
         val client_alive_file = File("${opts.out_dir}/.alive").apply { if (!exists()) createNewFile() }
@@ -120,7 +112,7 @@ object Nob {
             "-d", opts.target_dir.toString(),
             "-jvm-target", opts.jvm_target.toString(),
             "-Xbackend-threads=${opts.backend_threads}",
-            "-cp", listOf(opts.kotlin_stdlib, opts.kotlin_compiler, opts.kotlin_daemon_client, opts.kotlin_daemon).joinToString(":"),
+            "-cp", opts.kotlin_libs.joinToString(":"),
         )
         if (opts.verbose) args += "-verbose"
         if (opts.debug) args += "-Xdebug"
@@ -211,7 +203,6 @@ object DepResolution {
         for (dep in deps) {
             if (dep.scope in listOf("test", "provided")) continue
             resolve_transitive(dep, seen)
-
         }
         return seen
     }
@@ -225,50 +216,10 @@ object DepResolution {
         }
         val props = Properties.collect(doc, dep)
         val managed = collect_managed_versions(doc, dep).toMutableMap()
-        val deps = mutableListOf<Dep>()
         val dep_nodes = doc.getElementsByTagName("dependency")
-        for (i in 0 until dep_nodes.length) {
-            val node = dep_nodes.item(i) as org.w3c.dom.Element 
-            val group_id = node.getElementsByTagName("groupId").item(0).textContent
-            val artifact_id = node.getElementsByTagName("artifactId").item(0).textContent
-            val version_node = node.getElementsByTagName("version")
-            // resolve version: explicit > managed > skip optional
-            var version = if (version_node.length > 0) {
-                version_node.item(0).textContent.trim()
-            } else {
-                managed[group_id to artifact_id]
-                    ?.also { println("[INFO] using managed version for $group_id:$artifact_id") }
-                    ?: run { println("[WARN] no version for $group_id:$artifact_id (not managed), skipping."); continue }
-            }
-            // resolve properties in version
-            version = version.replace(Regex("""\$\{(.+?)}""")) { match ->
-                val prop_name = match.groupValues[1]
-                props[prop_name] ?: run {
-                    println("[WARN] unknown property $prop_name in $dep, skipping dependency $group_id:$artifact_id")
-                    "" // return dummy value to satisfy the lambda
-                }
-            }
-            if (version.isEmpty()) continue // skip dependency if versino could not be resolved
-            // resolve version ranges
-            if (version.contains('[') || version.contains('(')) {
-                version = Versioning.resolve_range(Dep(group_id, artifact_id, version))
-            }
-            val type_node = node.getElementsByTagName("type")
-            val type = if (type_node.length > 0) {
-                type_node.item(0).textContent.trim().replace(Regex("""\$\{(.+?)}""")) { match ->
-                    val prop_name = match.groupValues[1]
-                    props[prop_name] ?: error("unknown property $prop_name for type in $dep")
-                }
-            } else "jar"
-            val scope_node = node.getElementsByTagName("scope")
-            val scope = if (scope_node.length > 0) {
-                scope_node.item(0).textContent.trim().replace(Regex("""\$\{(.+?)}""")) { match ->
-                    val prop_name = match.groupValues[1]
-                    props[prop_name] ?: error("unknown property $prop_name for scope in $dep")
-                }
-            } else "compile"
-            deps.add(Dep(group_id, artifact_id, version, type = type, scope = scope))
-        }
+        val deps = (0 until dep_nodes.length)
+            .mapNotNull { (dep_nodes.item(it) as org.w3c.dom.Element).to_dep(props, managed, dep) }
+            .filterNot { it.scope in listOf("test", "provided")}
         return deps
     }
 
@@ -304,53 +255,33 @@ object DepResolution {
         dep: Dep,
         props: Map<String, String>? = null,
     ): Map<Pair<String, String>, String> {
-        // parent-managed versions
-        val props_map = props ?: Properties.collect(doc, dep)
+        val props = props ?: Properties.collect(doc, dep)
         val parent_managed = parse_parent(doc)?.let {
             val parent_doc = download_pom(it)
-            val parent_props = Properties.collect(parent_doc, it)
-            collect_managed_versions(parent_doc, it, parent_props)
+            collect_managed_versions(parent_doc, it, Properties.collect(parent_doc, it))
         } ?: emptyMap()
-
         val managed = mutableMapOf<Pair<String, String>, String>()
-
-        // dependency-managed versions
         val dm_nodes = doc.getElementsByTagName("dependencyManagement")
         if (dm_nodes.length > 0) {
             val deps = (dm_nodes.item(0) as org.w3c.dom.Element).getElementsByTagName("dependency")
             for (i in 0 until deps.length) {
                 val node = deps.item(i) as org.w3c.dom.Element
-                val group_id = node.getElementsByTagName("groupId").item(0).textContent
-                val artifact_id = node.getElementsByTagName("artifactId").item(0).textContent
-                var version = node.getElementsByTagName("version").item(0)?.textContent?.trim()
-                // resolve properties in version
-                if (version != null) {
-                    val unresolved = Regex("""\$\{(.+?)}""").findAll(version).map { it.groupValues[1] }
-                        .filter { it !in props_map }
-                        .toList()
-                    if (unresolved.isNotEmpty()) {
-                        println("[WARN] unknown properties ${unresolved.joinToString()} in $dep, skipping dependency")
-                        continue // skip this dependency entirely
-                    }
-                    version = version.replace(Regex("""\$\{(.+?)}""")) { match ->
-                        val prop_name = match.groupValues[1]
-                        props_map[prop_name]!!
-                    }
-                }
-                val type = node.getElementsByTagName("type").item(0)?.textContent ?: ""
-                val scope = node.getElementsByTagName("scope").item(0)?.textContent ?: ""
-                // handle BOM imports
+                val group_id = node.child_text("groupId", props, parent = dep) ?: continue
+                val artifact_id = node.child_text("artifactId", props, parent = dep) ?: continue
+                val version = node.child_text("version", props, parent = dep)
+                val type = node.child_text("type", props, default = "", parent = dep)
+                val scope = node.child_text("scope", props, default = "", parent = dep)
                 if (type == "pom" && scope == "import" && version != null) {
                     val bom_dep = Dep(group_id, artifact_id, version)
                     val bom_doc = try {
                         download_pom(bom_dep)
                     } catch (e: Exception) {
                         println("[WARN] failed to download BOM $bom_dep: ${e.message}, skipping")
-                        continue;
+                        continue
                     }
                     val bom_props = Properties.collect(bom_doc, bom_dep)
                     managed.putAll(collect_managed_versions(bom_doc, bom_dep, bom_props))
-                    continue // skip adding BOM as a regular dependency
+                    continue
                 }
                 if (version != null) {
                     managed[group_id to artifact_id] = version
@@ -360,7 +291,7 @@ object DepResolution {
         return parent_managed + managed
     }
 
-    private object Properties {
+    object Properties {
         fun parse(doc: org.w3c.dom.Document): Map<String, String> {
             val props = mutableMapOf<String, String>()
             val xpath = javax.xml.xpath.XPathFactory.newInstance().newXPath()
@@ -394,14 +325,7 @@ object DepResolution {
         }
     }
 
-    private object Versioning {
-
-        fun resolve(raw: String, props: Map<String, String>): String =
-            raw.replace(Regex("""\$\{(.+?)}""")) { match ->
-                val prop_name = match.groupValues[1]
-                props[prop_name] ?: error("unknown property $prop_name among $props")
-            }
-
+    object Versioning {
         fun resolve_range(dep: Dep): String {
             if(!dep.version.contains('[') && !dep.version.contains('(')) return dep.version
             val url = "${dep.base_url}/maven-metadata.xml"
@@ -448,20 +372,12 @@ object DepResolution {
                 else -> qualifier_compare(this.value, other.value)
             }
         }
-        fun tokenize(version: String): List<Item> = version
+        private fun tokenize(version: String): List<Item> = version
             .split('.', '-', '_')
             .filter { it.isNotEmpty() }
             .map { it.toBigIntegerOrNull()?.let { num -> Item(num.toString(), ItemType.Int) } ?: Item(it, ItemType.Str) }
 
-        private val QUALIFIERS = listOf(
-            "alpha", "a",
-            "beta", "b",
-            "milestone", "m",
-            "rc", "cr",
-            "snapshot",
-            "sp",
-            "", // empty qualifier = GA release = highest
-        )
+        private val QUALIFIERS = listOf("alpha", "a", "beta", "b", "milestone", "m", "rc", "cr", "snapshot", "sp", "")
 
         fun qualifier_compare(q1: String, q2: String): Int {
             if (q1 == q2) return 0
@@ -476,3 +392,42 @@ object DepResolution {
         }
     }
 }
+
+private fun org.w3c.dom.Element.child_text(
+    tag: String,
+    props: Map<String, String>,
+    default: String? = null,
+    parent: Dep? = null,
+): String? {
+    val node = getElementsByTagName(tag)
+    if (node.length == 0) return default
+    val raw = node.item(0).textContent.trim()
+    if (raw.isEmpty()) return default
+    return raw
+        .resolve_props(props) { prop -> "".also { println("[INFO] unresolved property $prop in ${parent ?: "element"} <$tag>, dependency may be skipped") } }
+        .ifEmpty { default }
+}
+
+private fun org.w3c.dom.Element.to_dep(
+    props: Map<String, String>,
+    managed: Map<Pair<String, String>, String>, 
+    parent_dep: Dep,
+): Dep? {
+    val group_id = child_text("groupId", props, parent = parent_dep)!!
+    val artifact_id = child_text("artifactId", props, parent = parent_dep)!!
+    var version = child_text("version", props, parent = parent_dep) ?: managed[group_id to artifact_id] ?: run {
+        println("[WARN] no version for $group_id:$artifact_id, skipping")
+        return null
+    }
+    if (version.contains('[') || version.contains('(')) {
+        version = DepResolution.Versioning.resolve_range(Dep(group_id, artifact_id, version))
+    }
+    val type = child_text("type", props, default = "jar")!!
+    val scope = child_text("scope", props, default = "compile")!!
+    return Dep(group_id, artifact_id, version, type = type, scope = scope)
+}
+
+private fun String.resolve_props(props: Map<String, String>, on_missing: (String) -> String = { ""}): String = 
+    replace(Regex("""\$\{(.+?)}""")) { match -> 
+        props[match.groupValues[1]] ?: on_missing(match.groupValues[1]) 
+    }
