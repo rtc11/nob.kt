@@ -26,9 +26,12 @@ fun main(args: Array<String>) {
     try {
         Nob.backup(nob_opts)
         Nob.compile(nob_opts)
-        val dep = Dep.of("io.ktor:ktor-server-netty:3.2.2")
+        val deps = listOf(
+            Dep.of("io.ktor:ktor-server-netty:3.2.2"),
+            Dep.of("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2"),
+        )
         val seen = mutableSetOf<Dep>()
-        DepResolution.print_tree(dep, seen = seen)
+        DepResolution.print_tree(deps, seen = seen)
         println("\nResolved ${seen.size} total dependencies.") 
 
         // val all = DepResolution.resolve_transitive(dep)
@@ -297,24 +300,38 @@ object DepResolution {
         return parent_managed + managed
     }
 
-    fun print_tree(dep: Dep, indent: String = "", seen: MutableSet<Dep> = mutableSetOf()) { 
-        if (!seen.add(dep)) return
-        println("$indent- $dep")
-        runCatching { 
-            resolve_transitive(dep)
-                .sortedWith(compareBy({ it.group_id }, { it.artifact_id }, { it.version })) 
-                .forEach { print_tree(it, indent + "  ", seen) }
-        }
+    fun print_tree(
+        roots: Collection<Dep>,
+        indent: String = "",
+        seen: MutableSet<Dep> = mutableSetOf(),
+        first_parent: MutableMap<Dep, Dep?> = mutableMapOf(),
+        parent: Dep? = null,
+    ) { 
+        for (dep in roots.sortedWith(compareBy({ it.group_id }, { it.artifact_id }, { it.version }))) {
+            if (!seen.add(dep)) {
+                first_parent[dep]?.let { println("$indent- $dep (see $it)")}
+                    ?: println("$indent- $dep (already shown)")
+                continue
+            }
+            first_parent[dep] = parent
+            println("$indent- $dep")
+            runCatching { 
+                resolve_transitive(dep)
+                    .sortedWith(compareBy({ it.group_id }, { it.artifact_id }, { it.version })) 
+                    .forEach { 
+                        print_tree(listOf(it), indent + "  ", seen, first_parent, dep) 
+                    }
+            }
+        } 
     }
 
-    fun resolve_transitive(dep: Dep, seen: MutableSet<Dep> = mutableSetOf()): Set<Dep> {
+    fun resolve_transitive(dep: Dep, seen: MutableSet<Dep> = mutableSetOf()): Set<Dep> = resolve_transitive(listOf(dep), seen)
+    fun resolve_transitive(roots: Collection<Dep>, seen: MutableSet<Dep> = mutableSetOf()): Set<Dep> {
         val resolved = mutableSetOf<Dep>()
         val to_process = ArrayDeque<Dep>()
-        to_process.add(dep)
-
+        to_process.addAll(roots)
         // Track discovered managed versions (BOMs / parents)
         val global_managed_versions = mutableMapOf<Pair<String, String>, String>()
-
         while (to_process.isNotEmpty()) {
             val current = to_process.removeFirst()
             if (current in resolved || current in seen) continue
@@ -331,7 +348,7 @@ object DepResolution {
                 collect_managed_versions(doc, current)
             } catch (e: Exception) {
                 warn("failed to collect managed versions for $current: ${e.message}")
-                emptyMap<Pair<String, String>, String>()
+                emptyMap()
             }
             global_managed_versions.putAll(managed_versions)
             val props = try {
@@ -361,7 +378,7 @@ object DepResolution {
                 if (optional || scope == "test" || scope == "provided") continue
                 // handle BOM imports
                 if (type == "pom" && scope == "import") {
-                    to_process.addAll(try { resolve_transitive(Dep(group_id, artifact_id, version), seen) } catch (_: Exception) { emptySet() })
+                    to_process.addAll(try { resolve_transitive(listOf(Dep(group_id, artifact_id, version)), seen) } catch (_: Exception) { emptySet() })
                     continue
                 }
                 to_process.add(Dep(group_id, artifact_id, version))
