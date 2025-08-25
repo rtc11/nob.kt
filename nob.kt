@@ -15,6 +15,9 @@ import org.jetbrains.kotlin.cli.common.messages.PrintingMessageCollector
 import org.jetbrains.kotlin.daemon.client.*
 import org.jetbrains.kotlin.daemon.common.*
 
+const val DEBUG = false
+
+// TODO: build nob, then use the exeutable as CLI to build Main.kt
 fun main(args: Array<String>) {
     val kotlin_libs = args.get(0).split(':').map(Paths::get)
     val nob_opts = Opts("nob.kt", kotlin_libs, out_dir = "out/nob")
@@ -23,10 +26,14 @@ fun main(args: Array<String>) {
     try {
         Nob.backup(nob_opts)
         Nob.compile(nob_opts)
-        val dep = Dep.of("org.apache.commons:commons-lang3:3.14.0")
-        val all = DepResolution.resolve_transitive(dep)
-        println("[INFO] resolved dependencies:")
-        all.forEach { println("[INFO] $it") }
+        // val dep = Dep.of("org.apache.commons:commons-lang3:3.14.0")
+        val dep = Dep.of("io.ktor:ktor-server-netty:3.2.2")
+        val seen = mutableSetOf<Dep>()
+        DepResolution.print_tree(dep, seen = seen)
+        println("\nResolved ${seen.size} total dependencies.") 
+        // val all = DepResolution.resolve_transitive(dep)
+        // println("[INFO] resolved dependencies:")
+        // all.forEach { println("[INFO] $it") }
         val exit_code = Nob.compile(opts)
         System.exit(exit_code)
     } catch (e: Exception) {
@@ -60,12 +67,17 @@ data class Opts(
     }
 }
 
+fun debug(msg: String) { if (DEBUG) println("[DEBUG] $msg") }
+fun info(msg: String) { if (DEBUG) println("[INFO] $msg") }
+fun warn(msg: String) { if (DEBUG) println("[WARN] $msg") }
+fun err(msg: String) { println("[ERR] $msg") }
+
 object Nob {
     fun release(opts: Opts): Int {
         val opts = opts.copy(debug = false, error = true)
         val cmd = opts.jar_command()
         if (opts.verbose) println("[INFO] $cmd")
-        println("[INFO] package ${opts.name}.jar")
+        info("package ${opts.name}.jar")
         return run_command(cmd, opts)
     }
 
@@ -74,7 +86,7 @@ object Nob {
         val cls_modified = if (Files.exists(opts.cls)) Files.getLastModifiedTime(opts.cls).toInstant() else Instant.EPOCH
 
         if (src_modified > cls_modified) {
-            println("[INFO] compiling ${opts.name} to ${opts.target_dir}")
+            info("compiling ${opts.name} to ${opts.target_dir}")
             compile_with_daemon(opts) 
         } 
         return 0
@@ -83,7 +95,7 @@ object Nob {
     fun backup(opts: Opts) {
         val cls = opts.cls.toFile()
         if (cls.exists()) {
-            println("[INFO] backup ${opts.cls}")
+            info("backup ${opts.cls}")
             val backup = File(cls.parentFile, cls.name + ".bak")
             cls.copyTo(backup, overwrite = true)
         }
@@ -93,13 +105,13 @@ object Nob {
         val cls = opts.cls.toFile()
         val backup = File(cls.parentFile, opts.name + ".bak")
         if (backup.exists()) {
-            println("[INFO] restoring ${opts.cls}")
+            info("restoring ${opts.cls}")
             backup.copyTo(cls, overwrite = true) 
         }
     }
 
     fun default_src(): String = "Main.kt".also {
-        println("[INFO] No src file specified, using $it")
+        info("No src file specified, using $it")
     }
 
     fun compile_with_daemon(opts: Opts): Int {
@@ -146,7 +158,7 @@ object Nob {
                 reportSeverity = ReportSeverity.INFO,
             )
             val end_time = System.nanoTime()
-            println("[INFO] Compilation complete in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
+            info("Compilation complete in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
             return exit_code
         } finally {
             daemon.releaseCompileSession(session_id) 
@@ -154,15 +166,15 @@ object Nob {
     }
 
     fun clear(opts: Opts): Int {
-        println("[INFO] clear ${opts.target_dir}")
+        info("clear ${opts.target_dir}")
         return run_command("rm -rf ${opts.target_dir}", opts)
     }
 
     fun run_command(cmd: String, opts: Opts): Int {
         val cmd = listOf("/bin/sh", "-c", cmd)
         if (opts.verbose) {
-            println("[INFO] command: $cmd")
-            println("[INFO] build dir: ${opts.cwd}")
+            info("command: $cmd")
+            info("build dir: ${opts.cwd}")
         }
         val builder = ProcessBuilder(cmd)
         builder.inheritIO()
@@ -197,7 +209,7 @@ object DepResolution {
         val deps = try {
             download(dep)
         } catch (e: FileNotFoundException) {
-            println("[WARN] $dep not found. Skipping...")
+            warn("$dep not found. Skipping...")
             emptyList()
         }
         for (dep in deps) {
@@ -211,7 +223,7 @@ object DepResolution {
         val doc = try {
             download_pom(dep)
         } catch (e: Exception) {
-            println("[WARN] $dep not found. Skipping...")
+            warn("$dep not found. Skipping...")
             return emptyList()
         }
         val props = Properties.collect(doc, dep)
@@ -227,18 +239,27 @@ object DepResolution {
         "&oslash;" to "ø", "&Oslash;" to "Ø", "&auml;" to "ä", "&ouml;" to "ö", "&uuml;" to "ü", "&Auml;" to "Ä",
         "&Ouml;" to "Ö", "&Uuml;" to "Ü", "&amp;" to "&", "&lt;" to "<", "&gt;" to ">", "&quot;" to "\"", "&apos;" to "'"
     )
+
     fun download_pom(dep: Dep): org.w3c.dom.Document {
         pom_cache[dep.toString()]?.let { return it }
-        println("[INFO] fetching ${dep.pom_url}")
+        debug("fetching ${dep.pom_url}")
         val stream = URI(dep.pom_url).toURL().openStream()
         val text = stream.bufferedReader().use { it.readText() }
-        val fixed_text = common_problematic_html_entities.entries.fold(text) { acc, (k, v) -> acc.replace(k, v) }
+        var fixed_text = common_problematic_html_entities.entries.fold(text) { acc, (k, v) -> acc.replace(k, v) }
+        fixed_text = fixed_text.replace(Regex("&(?![a-zA-Z]+;|#\\d+;|#x[0-9a-fA-F]+;)"), "&amp;")
+        fixed_text = fixed_text.replace(Regex("<\\?xml[^>]*\\?>"), "")
         val factory = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }
         val doc = factory.newDocumentBuilder().parse(fixed_text.byteInputStream())
         doc.documentElement.normalize()
         pom_cache[dep.toString()] = doc
         return doc
     } 
+
+    fun download_jar(dep: Dep, dest: File) {
+        info("downloading ${dep.jar_url}")
+        val stream = URI(dep.jar_url).toURL().openStream()
+        dest.outputStream().use { stream.copyTo(it) }
+    }
 
     fun parse_parent(doc: org.w3c.dom.Document): Dep? {
         val parent_nodes = doc.getElementsByTagName("parent")
@@ -276,7 +297,7 @@ object DepResolution {
                     val bom_doc = try {
                         download_pom(bom_dep)
                     } catch (e: Exception) {
-                        println("[WARN] failed to download BOM $bom_dep: ${e.message}, skipping")
+                        warn("failed to download BOM $bom_dep: ${e.message}, skipping")
                         continue
                     }
                     val bom_props = Properties.collect(bom_doc, bom_dep)
@@ -289,6 +310,17 @@ object DepResolution {
             }
         }
         return parent_managed + managed
+    }
+
+    fun print_tree(dep: Dep, indent: String = "", seen: MutableSet<Dep>) {
+        if (!seen.add(dep)) return
+        println("$indent- $dep")
+        val children = try {
+            download(dep).filterNot{ it.scope in listOf("test", "provided") }
+        } catch (e: Exception) { 
+            return
+        }
+        for (child in children) print_tree(child, indent + "  ", seen)
     }
 
     object Properties {
@@ -404,7 +436,7 @@ private fun org.w3c.dom.Element.child_text(
     val raw = node.item(0).textContent.trim()
     if (raw.isEmpty()) return default
     return raw
-        .resolve_props(props) { prop -> "".also { println("[INFO] unresolved property $prop in ${parent ?: "element"} <$tag>, dependency may be skipped") } }
+        .resolve_props(props) { prop -> "".also { debug("unresolved property $prop in ${parent ?: "element"} <$tag>, dependency may be skipped") } }
         .ifEmpty { default }
 }
 
@@ -416,7 +448,7 @@ private fun org.w3c.dom.Element.to_dep(
     val group_id = child_text("groupId", props, parent = parent_dep)!!
     val artifact_id = child_text("artifactId", props, parent = parent_dep)!!
     var version = child_text("version", props, parent = parent_dep) ?: managed[group_id to artifact_id] ?: run {
-        println("[WARN] no version for $group_id:$artifact_id, skipping")
+        debug("no version for $group_id:$artifact_id, skipping")
         return null
     }
     if (version.contains('[') || version.contains('(')) {
