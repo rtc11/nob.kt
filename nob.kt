@@ -204,21 +204,6 @@ data class Dep(
 object DepResolution {
     private val pom_cache = mutableMapOf<String, org.w3c.dom.Document>()
 
-    fun resolve_transitive(dep: Dep, seen: MutableSet<Dep> = mutableSetOf()): Set<Dep> {
-        if (!seen.add(dep)) return seen
-        val deps = try {
-            download(dep)
-        } catch (e: FileNotFoundException) {
-            warn("$dep not found. Skipping...")
-            emptyList()
-        }
-        for (dep in deps) {
-            if (dep.scope in listOf("test", "provided")) continue
-            resolve_transitive(dep, seen)
-        }
-        return seen
-    }
-
     fun download(dep: Dep): List<Dep> {
         val doc = try {
             download_pom(dep)
@@ -312,24 +297,17 @@ object DepResolution {
         return parent_managed + managed
     }
 
-    fun print_tree(dep: Dep, indent: String = "", seen: MutableSet<Dep> = mutableSetOf()) {
+    fun print_tree(dep: Dep, indent: String = "", seen: MutableSet<Dep> = mutableSetOf()) { 
         if (!seen.add(dep)) return
         println("$indent- $dep")
-
-        val children = try {
-            val allDeps = collect_all_dependencies(dep)
-            allDeps.filter { it != dep }  // avoid self-reference
-        } catch (e: Exception) {
-            println("$indent  [WARN] failed to collect dependencies: ${e.message}")
-            return
-        }
-
-        for (child in children) {
-            print_tree(child, indent + "  ", seen)
+        runCatching { 
+            resolve_transitive(dep)
+                .sortedWith(compareBy({ it.group_id }, { it.artifact_id }, { it.version })) 
+                .forEach { print_tree(it, indent + "  ", seen) }
         }
     }
 
-    fun collect_all_dependencies(dep: Dep, seen: MutableSet<Dep> = mutableSetOf()): Set<Dep> {
+    fun resolve_transitive(dep: Dep, seen: MutableSet<Dep> = mutableSetOf()): Set<Dep> {
         val resolved = mutableSetOf<Dep>()
         val to_process = ArrayDeque<Dep>()
         to_process.add(dep)
@@ -340,17 +318,14 @@ object DepResolution {
         while (to_process.isNotEmpty()) {
             val current = to_process.removeFirst()
             if (current in resolved || current in seen) continue
-
             resolved.add(current)
             seen.add(current)
-
             val doc = try {
                 download_pom(current)
             } catch (e: Exception) {
                 warn("failed to download or parse POM $current: ${e.message}")
                 continue
             }
-
             // Collect managed versions from BOMs / parent POMs
             val managed_versions = try {
                 collect_managed_versions(doc, current)
@@ -359,14 +334,12 @@ object DepResolution {
                 emptyMap<Pair<String, String>, String>()
             }
             global_managed_versions.putAll(managed_versions)
-
             val props = try {
                 Properties.collect(doc, current)
             } catch (e: Exception) {
                 warn("failed to collect properties for $current: ${e.message}")
                 emptyMap()
             }
-
             // Process declared dependencies
             val dep_nodes = doc.getElementsByTagName("dependency")
             for (i in 0 until dep_nodes.length) {
@@ -374,7 +347,6 @@ object DepResolution {
                 val group_id = node.child_text("groupId", props = props, parent = current) ?: continue
                 val artifact_id = node.child_text("artifactId", props = emptyMap(), parent = current) ?: continue
                 var version = node.child_text("version", props = props, parent = current)
-
                 // fallback to managed version
                 if (version == null) {
                     version = managed_versions[group_id to artifact_id]
@@ -383,39 +355,26 @@ object DepResolution {
                         continue
                     }
                 }
-
                 val type = node.child_text("type", props = props, parent = current) ?: ""
                 val scope = node.child_text("scope", props = props, parent = current) ?: ""
                 val optional = node.child_text("optional", props = props, parent = current) == "true"
-
-                // skip optional / test / provided if desired
                 if (optional || scope == "test" || scope == "provided") continue
-
                 // handle BOM imports
                 if (type == "pom" && scope == "import") {
-                    val bom_dep = Dep(group_id, artifact_id, version)
-                    val bom_deps = try { collect_all_dependencies(bom_dep, seen) } catch (_: Exception) { emptySet() }
-                    to_process.addAll(bom_deps)
+                    to_process.addAll(try { resolve_transitive(Dep(group_id, artifact_id, version), seen) } catch (_: Exception) { emptySet() })
                     continue
                 }
-
                 to_process.add(Dep(group_id, artifact_id, version))
             }
         }
-
         // Collapse multiple versions
         return resolved
-            .groupBy { it.group_id to it.artifact_id }
-            .map { (ga, deps) ->
-                val managed = global_managed_versions[ga]
-                if (managed != null) {
-                    Dep(ga.first, ga.second, managed)
-                } else {
-                    // pick highest version
-                    deps.maxByOrNull { ComparableVersion(Versioning.to_comparable_version(it.version)) }!!
+            .groupBy { it.group_id to it.artifact_id }.map { (ga, deps) ->
+                when (val managed = global_managed_versions[ga]) {
+                    null -> deps.maxByOrNull { ComparableVersion(Versioning.to_comparable_version(it.version)) }!! 
+                    else -> Dep(ga.first, ga.second, managed) 
                 }
-            }
-            .toSet()
+            }.toSet()
     }
 
     object Properties {
