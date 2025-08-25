@@ -11,8 +11,23 @@ Make sure the KOTLIN_LIB path is correct.
 
 # Usage
 Bootstrap nob for the first time, and compile Main.kt
-> ./nob Main.kt
+> ./nob
 
-Compile changes in nob.kt or Main.kt
-> ./nob Main.kt
+Recompile changes in nob.kt or Main.kt
+> ./nob
+
+Download and cache dependencies:
+
+Update nob.kt
+```kotlin
+val deps = DepResolution.resolve_with_cache(
+    listOf(
+        Dep.of("io.ktor:ktor-server-netty:3.2.2"),
+        Dep.of("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2"),
+    )
+)
+val opts = Opts(libs = listOf(deps.map { it.jar_path() }))
+Nob.compile(opts)
+```
+
 
