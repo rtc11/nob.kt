@@ -17,38 +17,53 @@ import org.jetbrains.kotlin.daemon.common.*
 
 const val DEBUG = false
 
-// TODO: build nob, then use the exeutable as CLI to build Main.kt
-fun main(args: Array<String>) {
-    val kotlin_libs = args.get(0).split(':').map(Paths::get)
-    val nob_opts = Opts("nob.kt", kotlin_libs, out_dir = "out/nob")
-    val opts = Opts(args.getOrNull(1) ?: Nob.default_src(), kotlin_libs)
-
-    try {
-        Nob.backup(nob_opts)
-        Nob.compile(nob_opts)
-        val deps = listOf(
-            Dep.of("io.ktor:ktor-server-netty:3.2.2"),
-            Dep.of("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2"),
+private fun compile_target(nob_opts: Opts): Int {
+    val deps = DepResolution.resolve_transitive(
+        listOf(
+            // Dep.of("io.ktor:ktor-server-netty:3.2.2"),
+            // Dep.of("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2"),
         )
-        val seen = mutableSetOf<Dep>()
-        DepResolution.print_tree(deps, seen = seen)
-        println("\nResolved ${seen.size} total dependencies.") 
+    )
+    val opts = nob_opts.copy(
+        src_file = "Main.kt",
+        out_dir = "out/main",
+        libs = deps.map { it.jar_path() }
+    )
+    val exit_code =  Nob.compile(opts)
+    run_target(opts)
+    return exit_code
+}
 
-        // val all = DepResolution.resolve_transitive(dep)
-        // println("[INFO] resolved dependencies:")
-        // all.forEach { println("[INFO] $it") }
-        val exit_code = Nob.compile(opts)
-        System.exit(exit_code)
-    } catch (e: Exception) {
+private fun run_target(opts: Opts) {
+    val classpath = (listOf(opts.target_dir) + opts.kotlin_libs + opts.libs).joinToString(":")
+    val main_class = opts.name.replaceFirstChar { it.uppercase() } + "Kt"
+    Nob.exec(listOf("java", "-cp", classpath, main_class), opts)
+}
+
+fun main(args: Array<String>) {
+    val nob_opts = Opts(
+        src_file = "nob.kt",
+        kotlin_libs = args.get(0).split(':').map(Paths::get),
+        out_dir = "out/nob",
+    )
+    compile_self(nob_opts)
+    System.exit(compile_target(nob_opts))
+}
+
+private fun compile_self(opts: Opts) {
+    try {
+        require(Nob.compile(opts, backup = true) == 0) { "Failed to compile nob." }
+        require(Files.exists(opts.cls)) { "NobKt.class not found after compilation!"}
+    } catch(e: Exception) {
         e.printStackTrace()
-        Nob.restore(nob_opts)
-        System.exit(1)
+        Nob.restore(opts)
     }
 }
 
 data class Opts(
     val src_file: String,
     val kotlin_libs: List<Path>, 
+    val libs: List<Path> = emptyList(),
     val out_dir: String = "out",
     val jvm_target: Int = 21,
     val backend_threads: Int = 1, // run codegen with N thread per processor (Default 1)
@@ -65,13 +80,13 @@ data class Opts(
     val cls: Path = target_dir.resolve(name.replaceFirstChar{ it.uppercase() } + "Kt.class")
     val main_path: Path = Paths.get(cwd, src_file)
 
-    fun jar_command(): String {
-        return """jar cfe ${name}.jar ${name}Kt -C "$target_dir" ."""
+    fun jar_command(): List<String> {
+        return listOf("jar", "cfe", "${name}.jar", "${name}Kt", "-C", "$target_dir", ".")
     }
 }
 
 fun debug(msg: String) { if (DEBUG) println("[DEBUG] $msg") }
-fun info(msg: String) { if (DEBUG) println("[INFO] $msg") }
+fun info(msg: String) { if (!DEBUG) println("[INFO] $msg") }
 fun warn(msg: String) { if (DEBUG) println("[WARN] $msg") }
 fun err(msg: String) { println("[ERR] $msg") }
 
@@ -81,16 +96,15 @@ object Nob {
         val cmd = opts.jar_command()
         if (opts.verbose) println("[INFO] $cmd")
         info("package ${opts.name}.jar")
-        return run_command(cmd, opts)
+        return exec(cmd, opts)
     }
 
-    fun compile(opts: Opts): Int {
+    fun compile(opts: Opts, backup: Boolean = false): Int {
         val src_modified = Files.getLastModifiedTime(opts.src).toInstant() 
         val cls_modified = if (Files.exists(opts.cls)) Files.getLastModifiedTime(opts.cls).toInstant() else Instant.EPOCH
-
         if (src_modified > cls_modified) {
-            info("compiling ${opts.name} to ${opts.target_dir}")
-            compile_with_daemon(opts) 
+            if (backup) backup(opts)
+            return compile_with_daemon(opts) 
         } 
         return 0
     }
@@ -113,10 +127,6 @@ object Nob {
         }
     }
 
-    fun default_src(): String = "Main.kt".also {
-        info("No src file specified, using $it")
-    }
-
     fun compile_with_daemon(opts: Opts): Int {
         val compiler_id = CompilerId.makeCompilerId(opts.kotlin_libs.map { it.toFile() })
         val daemon_opts = DaemonOptions(verbose = opts.verbose)
@@ -127,7 +137,7 @@ object Nob {
             "-d", opts.target_dir.toString(),
             "-jvm-target", opts.jvm_target.toString(),
             "-Xbackend-threads=${opts.backend_threads}",
-            "-cp", opts.kotlin_libs.joinToString(":"),
+            "-cp", (opts.kotlin_libs + opts.libs).joinToString(":"),
         )
         if (opts.verbose) args += "-verbose"
         if (opts.debug) args += "-Xdebug"
@@ -161,24 +171,15 @@ object Nob {
                 reportSeverity = ReportSeverity.INFO,
             )
             val end_time = System.nanoTime()
-            info("Compilation complete in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
+            info("Compiled ${opts.src_file} in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
             return exit_code
         } finally {
             daemon.releaseCompileSession(session_id) 
         }
     }
 
-    fun clear(opts: Opts): Int {
-        info("clear ${opts.target_dir}")
-        return run_command("rm -rf ${opts.target_dir}", opts)
-    }
-
-    fun run_command(cmd: String, opts: Opts): Int {
-        val cmd = listOf("/bin/sh", "-c", cmd)
-        if (opts.verbose) {
-            info("command: $cmd")
-            info("build dir: ${opts.cwd}")
-        }
+    fun exec(cmd: List<String>, opts: Opts): Int {
+        if (opts.verbose) info("exec: $cmd")
         val builder = ProcessBuilder(cmd)
         builder.inheritIO()
         builder.directory(File(opts.cwd))
@@ -198,6 +199,7 @@ data class Dep(
     val base_url = "$repo/${group_id.replace('.', '/')}/$artifact_id" 
     val pom_url = "$base_url/$version/$artifact_id-$version.pom"
     val jar_url = "$base_url/$version/$artifact_id-$version.jar"
+    fun jar_path(): Path = Paths.get("/libs/$group_id/$artifact_id/$version.jar")
     override fun toString() = "$group_id:$artifact_id:$version"
     companion object {
         fun of(str: String) = str.split(':').let { Dep(it[0], it[1], it[2], type = it.getOrElse(3) { "compile" }) }
@@ -300,32 +302,35 @@ object DepResolution {
         return parent_managed + managed
     }
 
+    fun print_tree(vararg deps: Dep) {
+        val seen = mutableSetOf<Dep>()
+        print_tree(deps.toSet(), seen = seen)
+        println("\nResolved ${seen.size} total dependencies.") 
+    }
+
     fun print_tree(
         roots: Collection<Dep>,
         indent: String = "",
         seen: MutableSet<Dep> = mutableSetOf(),
         first_parent: MutableMap<Dep, Dep?> = mutableMapOf(),
         parent: Dep? = null,
+        show_all: Boolean = false,
     ) { 
         for (dep in roots.sortedWith(compareBy({ it.group_id }, { it.artifact_id }, { it.version }))) {
             if (!seen.add(dep)) {
-                first_parent[dep]?.let { println("$indent- $dep (see $it)")}
-                    ?: println("$indent- $dep (already shown)")
+                if (show_all) first_parent[dep]?.let { println("$indent- $dep (see $it)")} ?: println("$indent- $dep (already shown)")
                 continue
             }
             first_parent[dep] = parent
             println("$indent- $dep")
             runCatching { 
-                resolve_transitive(dep)
+                resolve_transitive(listOf(dep))
                     .sortedWith(compareBy({ it.group_id }, { it.artifact_id }, { it.version })) 
-                    .forEach { 
-                        print_tree(listOf(it), indent + "  ", seen, first_parent, dep) 
-                    }
+                    .forEach { print_tree(listOf(it), indent + "  ", seen, first_parent, dep) }
             }
         } 
     }
 
-    fun resolve_transitive(dep: Dep, seen: MutableSet<Dep> = mutableSetOf()): Set<Dep> = resolve_transitive(listOf(dep), seen)
     fun resolve_transitive(roots: Collection<Dep>, seen: MutableSet<Dep> = mutableSetOf()): Set<Dep> {
         val resolved = mutableSetOf<Dep>()
         val to_process = ArrayDeque<Dep>()
