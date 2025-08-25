@@ -29,11 +29,10 @@ private fun compile_target(nob_opts: Opts): Int {
             // Dep.of("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2"),
         )
     )
-    DepResolution.print_tree(deps)
     val opts = nob_opts.copy(
         src_file = "Main.kt",
         out_dir = "out/main",
-        libs = deps.map { it.jar_path() }
+        libs = listOf(nob_opts.target_dir) + deps.map { it.jar_path() }
     )
     val exit_code =  Nob.compile(opts)
     run_target(opts)
@@ -41,7 +40,9 @@ private fun compile_target(nob_opts: Opts): Int {
 }
 
 private fun run_target(opts: Opts) {
-    val classpath = (listOf(opts.target_dir) + opts.kotlin_libs + opts.libs).joinToString(":")
+    val classpath = (listOf(Paths.get(opts.out_dir), Paths.get("out/nob")) + opts.kotlin_libs + opts.libs)
+        .filter{ Files.exists(it) }
+        .joinToString(":")
     val main_class = opts.name.replaceFirstChar { it.uppercase() } + "Kt"
     Nob.exec(listOf("java", "-cp", classpath, main_class), opts)
 }
