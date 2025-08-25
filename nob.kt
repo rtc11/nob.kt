@@ -266,9 +266,11 @@ object DepResolution {
         if (dep.artifact_id.endsWith("-common") || dep.artifact_id.endsWith("-metadata")) return
         val jar_path = jar_cache_dir.resolve("${dep.group_id}_${dep.artifact_id}_${dep.version}.jar")
         if (!jar_path.toFile().exists()) {
-            runCatching {
+            try {
                 URI(dep.jar_url).toURL().openStream().use { it.transferTo(Files.newOutputStream(jar_path)) }
                 info("[OK] download ${dep.jar_url}")
+            } catch (e: Exception) {
+                info("[FAIL] download ${dep.jar_url}")
             }
         }
     }
@@ -466,7 +468,7 @@ object DepResolution {
 
     fun resolve_with_cache(requested: List<Dep>): Set<Dep> {
         val cached = load_cached_deps().toMutableSet()
-        val resolved = resolve_transitive(requested)
+        val resolved = resolve_transitive(requested, seen = cached)
         for (dep in resolved) download_jar(dep)
         cached.addAll(resolved)
         save_deps(cached)
