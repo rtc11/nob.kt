@@ -4,12 +4,17 @@ import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.FileTime
 import java.time.Instant
 import java.util.*
 import java.util.concurrent.TimeUnit
 import java.util.function.*
 import javax.xml.parsers.DocumentBuilderFactory
+import javax.xml.transform.OutputKeys
+import javax.xml.transform.TransformerFactory
+import javax.xml.transform.dom.DOMSource
+import javax.xml.transform.stream.StreamResult
 import org.jetbrains.kotlin.cli.common.messages.MessageRenderer
 import org.jetbrains.kotlin.cli.common.messages.PrintingMessageCollector
 import org.jetbrains.kotlin.daemon.client.*
@@ -18,12 +23,13 @@ import org.jetbrains.kotlin.daemon.common.*
 const val DEBUG = false
 
 private fun compile_target(nob_opts: Opts): Int {
-    val deps = DepResolution.resolve_transitive(
+    val deps = DepResolution.resolve_with_cache(
         listOf(
-            // Dep.of("io.ktor:ktor-server-netty:3.2.2"),
+            Dep.of("io.ktor:ktor-server-netty:3.2.2"),
             // Dep.of("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2"),
         )
     )
+    DepResolution.print_tree(deps)
     val opts = nob_opts.copy(
         src_file = "Main.kt",
         out_dir = "out/main",
@@ -132,12 +138,13 @@ object Nob {
         val daemon_opts = DaemonOptions(verbose = opts.verbose)
         val daemon_jvm_opts = DaemonJVMOptions()
         val client_alive_file = File("${opts.out_dir}/.alive").apply { if (!exists()) createNewFile() }
+        val classpath = (opts.kotlin_libs + opts.libs).filter{ Files.exists(it) }.joinToString(":") 
         val args = mutableListOf(
             File(opts.src_file).absolutePath,
             "-d", opts.target_dir.toString(),
             "-jvm-target", opts.jvm_target.toString(),
             "-Xbackend-threads=${opts.backend_threads}",
-            "-cp", (opts.kotlin_libs + opts.libs).joinToString(":"),
+            "-cp", classpath,
         )
         if (opts.verbose) args += "-verbose"
         if (opts.debug) args += "-Xdebug"
@@ -199,7 +206,8 @@ data class Dep(
     val base_url = "$repo/${group_id.replace('.', '/')}/$artifact_id" 
     val pom_url = "$base_url/$version/$artifact_id-$version.pom"
     val jar_url = "$base_url/$version/$artifact_id-$version.jar"
-    fun jar_path(): Path = Paths.get("/libs/$group_id/$artifact_id/$version.jar")
+    fun jar_path(): Path = DepResolution.jar_cache_dir.resolve("${group_id}_${artifact_id}_$version.jar")
+    fun pom_path(): Path = DepResolution.jar_cache_dir.resolve("${group_id}_${artifact_id}_$version.pom")
     override fun toString() = "$group_id:$artifact_id:$version"
     companion object {
         fun of(str: String) = str.split(':').let { Dep(it[0], it[1], it[2], type = it.getOrElse(3) { "compile" }) }
@@ -208,6 +216,7 @@ data class Dep(
 
 object DepResolution {
     private val pom_cache = mutableMapOf<String, org.w3c.dom.Document>()
+    val jar_cache_dir = Paths.get(System.getProperty("user.home"), ".nob_cache").also { it.toFile().mkdirs() }
 
     fun download(dep: Dep): List<Dep> {
         val doc = try {
@@ -232,23 +241,36 @@ object DepResolution {
 
     fun download_pom(dep: Dep): org.w3c.dom.Document {
         pom_cache[dep.toString()]?.let { return it }
-        debug("fetching ${dep.pom_url}")
-        val stream = URI(dep.pom_url).toURL().openStream()
-        val text = stream.bufferedReader().use { it.readText() }
+        val pom_file = jar_cache_dir.resolve(dep.toString() + ".pom")
+        val text = if (pom_file.toFile().exists()) {
+            pom_file.toFile().readText()
+        } else {
+            val stream = URI(dep.pom_url).toURL().openStream()
+            val t = stream.bufferedReader().use { it.readText() }
+            pom_file.toFile().writeText(t)
+            t
+        }
         var fixed_text = common_problematic_html_entities.entries.fold(text) { acc, (k, v) -> acc.replace(k, v) }
         fixed_text = fixed_text.replace(Regex("&(?![a-zA-Z]+;|#\\d+;|#x[0-9a-fA-F]+;)"), "&amp;")
         fixed_text = fixed_text.replace(Regex("<\\?xml[^>]*\\?>"), "")
         val factory = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }
         val doc = factory.newDocumentBuilder().parse(fixed_text.byteInputStream())
         doc.documentElement.normalize()
+
+        // save to memory
         pom_cache[dep.toString()] = doc
         return doc
     } 
 
-    fun download_jar(dep: Dep, dest: File) {
-        info("downloading ${dep.jar_url}")
-        val stream = URI(dep.jar_url).toURL().openStream()
-        dest.outputStream().use { stream.copyTo(it) }
+    fun download_jar(dep: Dep) {
+        if (dep.artifact_id.endsWith("-common") || dep.artifact_id.endsWith("-metadata")) return
+        val jar_path = jar_cache_dir.resolve("${dep.group_id}_${dep.artifact_id}_${dep.version}.jar")
+        if (!jar_path.toFile().exists()) {
+            runCatching {
+                URI(dep.jar_url).toURL().openStream().use { it.transferTo(Files.newOutputStream(jar_path)) }
+                info("[OK] download ${dep.jar_url}")
+            }
+        }
     }
 
     fun parse_parent(doc: org.w3c.dom.Document): Dep? {
@@ -331,7 +353,10 @@ object DepResolution {
         } 
     }
 
-    fun resolve_transitive(roots: Collection<Dep>, seen: MutableSet<Dep> = mutableSetOf()): Set<Dep> {
+    fun resolve_transitive(
+        roots: Collection<Dep>,
+        seen: MutableSet<Dep> = mutableSetOf(),
+    ): Set<Dep> {
         val resolved = mutableSetOf<Dep>()
         val to_process = ArrayDeque<Dep>()
         to_process.addAll(roots)
@@ -342,8 +367,22 @@ object DepResolution {
             if (current in resolved || current in seen) continue
             resolved.add(current)
             seen.add(current)
+            val pom_file = current.pom_path().toFile()
             val doc = try {
-                download_pom(current)
+                if (pom_file.exists()) {
+                    DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(pom_file)
+                } else {
+                    try {
+                        val downloaded = download_pom(current)
+                        pom_file.parentFile.mkdirs()
+                        val xml = node_to_string(downloaded)
+                        pom_file.writeText(xml)
+                        downloaded
+                    } catch (e: Exception) {
+                        warn("missing POM for $current and no network: ${e.message}")
+                        continue
+                    }
+                }
             } catch (e: Exception) {
                 warn("failed to download or parse POM $current: ${e.message}")
                 continue
@@ -397,6 +436,41 @@ object DepResolution {
                     else -> Dep(ga.first, ga.second, managed) 
                 }
             }.toSet()
+    }
+
+    fun node_to_string(doc: org.w3c.dom.Document): String {
+        val transformer = TransformerFactory.newInstance().newTransformer()
+        transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "no")
+        transformer.setOutputProperty(OutputKeys.METHOD, "xml")
+        transformer.setOutputProperty(OutputKeys.INDENT, "yes")
+        val writer = StringWriter()
+        transformer.transform(DOMSource(doc), StreamResult(writer))
+        return writer.toString()
+    }
+
+    private val deps_cache_file = Paths.get("out/deps.lock")
+
+    fun load_cached_deps(): Set<Dep> {
+        if (!Files.exists(deps_cache_file)) return emptySet()
+        return deps_cache_file.toFile().readLines()
+            .filter { it.isNotBlank() }
+            .map { Dep.of(it) }
+            .toSet()
+    }
+
+    fun save_deps(deps: Set<Dep>) {
+        deps_cache_file.toFile().writeText(
+            deps.joinToString("\n") { it.toString() }
+        )
+    }
+
+    fun resolve_with_cache(requested: List<Dep>): Set<Dep> {
+        val cached = load_cached_deps().toMutableSet()
+        val resolved = resolve_transitive(requested)
+        for (dep in resolved) download_jar(dep)
+        cached.addAll(resolved)
+        save_deps(cached)
+        return resolved
     }
 
     object Properties {
