@@ -26,11 +26,11 @@ fun main(args: Array<String>) {
     try {
         Nob.backup(nob_opts)
         Nob.compile(nob_opts)
-        // val dep = Dep.of("org.apache.commons:commons-lang3:3.14.0")
         val dep = Dep.of("io.ktor:ktor-server-netty:3.2.2")
         val seen = mutableSetOf<Dep>()
         DepResolution.print_tree(dep, seen = seen)
         println("\nResolved ${seen.size} total dependencies.") 
+
         // val all = DepResolution.resolve_transitive(dep)
         // println("[INFO] resolved dependencies:")
         // all.forEach { println("[INFO] $it") }
@@ -290,8 +290,8 @@ object DepResolution {
                 val group_id = node.child_text("groupId", props, parent = dep) ?: continue
                 val artifact_id = node.child_text("artifactId", props, parent = dep) ?: continue
                 val version = node.child_text("version", props, parent = dep)
-                val type = node.child_text("type", props, default = "", parent = dep)
-                val scope = node.child_text("scope", props, default = "", parent = dep)
+                val type = node.child_text("type", props, default = "", parent = dep) ?: ""
+                val scope = node.child_text("scope", props, default = "", parent = dep) ?: ""
                 if (type == "pom" && scope == "import" && version != null) {
                     val bom_dep = Dep(group_id, artifact_id, version)
                     val bom_doc = try {
@@ -312,15 +312,110 @@ object DepResolution {
         return parent_managed + managed
     }
 
-    fun print_tree(dep: Dep, indent: String = "", seen: MutableSet<Dep>) {
+    fun print_tree(dep: Dep, indent: String = "", seen: MutableSet<Dep> = mutableSetOf()) {
         if (!seen.add(dep)) return
         println("$indent- $dep")
+
         val children = try {
-            download(dep).filterNot{ it.scope in listOf("test", "provided") }
-        } catch (e: Exception) { 
+            val allDeps = collect_all_dependencies(dep)
+            allDeps.filter { it != dep }  // avoid self-reference
+        } catch (e: Exception) {
+            println("$indent  [WARN] failed to collect dependencies: ${e.message}")
             return
         }
-        for (child in children) print_tree(child, indent + "  ", seen)
+
+        for (child in children) {
+            print_tree(child, indent + "  ", seen)
+        }
+    }
+
+    fun collect_all_dependencies(dep: Dep, seen: MutableSet<Dep> = mutableSetOf()): Set<Dep> {
+        val resolved = mutableSetOf<Dep>()
+        val to_process = ArrayDeque<Dep>()
+        to_process.add(dep)
+
+        // Track discovered managed versions (BOMs / parents)
+        val global_managed_versions = mutableMapOf<Pair<String, String>, String>()
+
+        while (to_process.isNotEmpty()) {
+            val current = to_process.removeFirst()
+            if (current in resolved || current in seen) continue
+
+            resolved.add(current)
+            seen.add(current)
+
+            val doc = try {
+                download_pom(current)
+            } catch (e: Exception) {
+                warn("failed to download or parse POM $current: ${e.message}")
+                continue
+            }
+
+            // Collect managed versions from BOMs / parent POMs
+            val managed_versions = try {
+                collect_managed_versions(doc, current)
+            } catch (e: Exception) {
+                warn("failed to collect managed versions for $current: ${e.message}")
+                emptyMap<Pair<String, String>, String>()
+            }
+            global_managed_versions.putAll(managed_versions)
+
+            val props = try {
+                Properties.collect(doc, current)
+            } catch (e: Exception) {
+                warn("failed to collect properties for $current: ${e.message}")
+                emptyMap()
+            }
+
+            // Process declared dependencies
+            val dep_nodes = doc.getElementsByTagName("dependency")
+            for (i in 0 until dep_nodes.length) {
+                val node = node_or_null(dep_nodes, i) ?: continue
+                val group_id = node.child_text("groupId", props = props, parent = current) ?: continue
+                val artifact_id = node.child_text("artifactId", props = emptyMap(), parent = current) ?: continue
+                var version = node.child_text("version", props = props, parent = current)
+
+                // fallback to managed version
+                if (version == null) {
+                    version = managed_versions[group_id to artifact_id]
+                    if (version == null) {
+                        warn("no version for $group_id:$artifact_id, skipping")
+                        continue
+                    }
+                }
+
+                val type = node.child_text("type", props = props, parent = current) ?: ""
+                val scope = node.child_text("scope", props = props, parent = current) ?: ""
+                val optional = node.child_text("optional", props = props, parent = current) == "true"
+
+                // skip optional / test / provided if desired
+                if (optional || scope == "test" || scope == "provided") continue
+
+                // handle BOM imports
+                if (type == "pom" && scope == "import") {
+                    val bom_dep = Dep(group_id, artifact_id, version)
+                    val bom_deps = try { collect_all_dependencies(bom_dep, seen) } catch (_: Exception) { emptySet() }
+                    to_process.addAll(bom_deps)
+                    continue
+                }
+
+                to_process.add(Dep(group_id, artifact_id, version))
+            }
+        }
+
+        // Collapse multiple versions
+        return resolved
+            .groupBy { it.group_id to it.artifact_id }
+            .map { (ga, deps) ->
+                val managed = global_managed_versions[ga]
+                if (managed != null) {
+                    Dep(ga.first, ga.second, managed)
+                } else {
+                    // pick highest version
+                    deps.maxByOrNull { ComparableVersion(Versioning.to_comparable_version(it.version)) }!!
+                }
+            }
+            .toSet()
     }
 
     object Properties {
@@ -395,6 +490,10 @@ object DepResolution {
             return 0
         }
 
+        fun to_comparable_version(str: String): List<Any> {
+            return str.split("[.-]".toRegex()).map { it.toIntOrNull() ?: it }
+        }
+
         private enum class ItemType { Int, Str }
         private data class Item(val value: String, val type: ItemType): Comparable<Item> {
             override fun compareTo(other: Item): Int = when {
@@ -423,6 +522,34 @@ object DepResolution {
             }
         }
     }
+}
+
+private data class ComparableVersion(val parts: List<Any>): Comparable<ComparableVersion> {
+    override fun compareTo(other: ComparableVersion): Int {
+        val maxSize = maxOf(parts.size, other.parts.size)
+        for (i in 0 until maxSize) {
+            val a = parts.getOrNull(i)
+            val b = other.parts.getOrNull(i)
+
+            if (a == null) return -1
+            if (b == null) return 1
+
+            val cmp = when {
+                a is Int && b is Int -> a.compareTo(b)
+                else -> a.toString().compareTo(b.toString())
+            }
+
+            if (cmp != 0) return cmp
+        }
+        return 0
+    }}
+
+private fun org.w3c.dom.Element.node_or_null(tag: String): org.w3c.dom.Element? =
+    getElementsByTagName(tag).item(0) as? org.w3c.dom.Element
+
+private fun node_or_null(nodes: org.w3c.dom.NodeList, index: Int): org.w3c.dom.Element? {
+    val node = nodes.item(index) ?: return null
+    return if (node.nodeType == org.w3c.dom.Node.ELEMENT_NODE) node as org.w3c.dom.Element else null
 }
 
 private fun org.w3c.dom.Element.child_text(
