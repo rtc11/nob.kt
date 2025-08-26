@@ -67,7 +67,15 @@ data class Opts(
 
     fun name(src_file: String) = src_file.removeSuffix(".kt").lowercase()
     fun src(src_file: String): Path = Paths.get(cwd, src_file).normalize()
-    fun main_class(src_file: String): Path = target_dir.resolve(name(src_file).replaceFirstChar{ it.uppercase() } + "Kt.class")
+    fun main_class(src_file: String): Path { 
+        val src = src(src_file).toFile()
+        val pkg = src.useLines { lines -> lines.firstOrNull { it.trim().startsWith("package ") }?.removePrefix("package ")?.trim() }
+        val class_name = name(src_file).replaceFirstChar{ it.uppercase() } + "Kt.class"
+        return when (pkg) {
+            null -> target_dir.resolve(class_name)
+            else -> target_dir.resolve(pkg.replace('.', '/')).resolve(class_name)
+        }
+    }
     fun main_path(src_file: String): Path = Paths.get(cwd, src_file)
 }
 
@@ -109,7 +117,11 @@ object Nob {
         return exec(cmd, opts)
     }
 
-    fun compile(opts: Opts, src_file: String, backup: Boolean = false): Int {
+    fun compile(
+        opts: Opts,
+        src_file: String,
+        backup: Boolean = false,
+    ): Int {
         val src = opts.src(src_file)
         val main_class = opts.main_class(src_file)
         val src_modified = Files.getLastModifiedTime(src).toInstant() 
@@ -226,7 +238,7 @@ private fun compile_with_daemon(opts: Opts, src_file: String): Int {
             reportSeverity = ReportSeverity.INFO,
         )
         val end_time = System.nanoTime()
-        info("Compiled ${opts.src_file} in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
+        info("Compiled $src_file in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
         return exit_code
     } finally {
         daemon.releaseCompileSession(session_id) 
