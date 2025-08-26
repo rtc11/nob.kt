@@ -29,7 +29,8 @@ private fun compile_target(opts: Opts): Int {
         libs = Nob.resolve_libs(
             listOf(
                 Lib.of("io.ktor:ktor-server-netty:3.2.2"),
-            )
+            ),
+            opts
         )
     )
     val exit_code =  Nob.compile(opts, opts.src_file)
@@ -52,7 +53,7 @@ data class Opts(
     val jvm_target: Int = 21,
     val backend_threads: Int = 1, // run codegen with N thread per processor (Default 1)
     val verbose: Boolean = false,
-    val debug: Boolean = true,
+    val debug: Boolean = false,
     val error: Boolean = false,
     val extra: Boolean = true,
 ) {
@@ -112,7 +113,7 @@ object Nob {
         val opts = opts.copy(debug = false, error = true)
         val name = opts.name(opts.src_file)
         val cmd = listOf("jar", "cfe", "${name}.jar", "${name}Kt", "-C", "${opts.target_dir}", ".")
-        if (opts.verbose) println("[INFO] $cmd")
+        if (opts.verbose) info("$cmd")
         info("package ${name}.jar")
         return exec(cmd, opts)
     }
@@ -151,7 +152,7 @@ object Nob {
         }
     }
 
-    fun resolve_libs(libs: List<Lib>): Set<Lib> {
+    fun resolve_libs(libs: List<Lib>, opts: Opts): Set<Lib> {
         val cached = load_cached_libs().toMutableSet()
         val resolved = resolve_transitive(libs, seen = cached)
         for (lib in resolved) download_jar(lib)
@@ -163,7 +164,7 @@ object Nob {
     fun print_tree(vararg libs: Lib) {
         val seen = mutableSetOf<Lib>()
         print_tree(libs.toSet(), seen = seen)
-        println("\nResolved ${seen.size} total dependencies.") 
+        info("Resolved ${color(seen.size, Color.green)} total dependencies.") 
     }
 }
 
@@ -180,6 +181,7 @@ private fun compile_self(opts: Opts) {
 }
 
 private fun run_target(opts: Opts) {
+    info("Running ${opts.name(opts.src_file)}...")
     val main_class = opts.name(opts.src_file).replaceFirstChar { it.uppercase() } + "Kt"
     exec(listOf("java", "-cp", opts.classpath, main_class), opts)
 }
@@ -218,7 +220,7 @@ private fun compile_with_daemon(opts: Opts, src_file: String): Int {
         clientAliveFlagFile = client_alive_file,
         daemonJVMOptions = daemon_jvm_opts,
         daemonOptions = daemon_opts,
-        reportingTargets = DaemonReportingTargets(out = System.out, messages = daemon_reports),
+        reportingTargets = DaemonReportingTargets(out = if (opts.verbose) System.out else null, messages = daemon_reports),
         autostart = true,
     ) ?: error("unable to connect to compiler daemon: " + 
         daemon_reports.joinToString("\n  ", prefix = "\n  ") { 
@@ -244,6 +246,17 @@ private fun compile_with_daemon(opts: Opts, src_file: String): Int {
         daemon.releaseCompileSession(session_id) 
     }
 }
+
+private enum class Color(val code: String) {
+    reset("\u001B[0m"),
+    red("\u001B[31m"),
+    green("\u001B[32m"),
+    yellow("\u001B[33m"),
+    blue("\u001B[34m"),
+    magenta("\u001B[35m"),
+    cyan("\u001B[36m")
+}
+private fun color(text: Any, color: Color) = "${color.code}$text${Color.reset.code}" 
 
 private val pom_cache = mutableMapOf<String, org.w3c.dom.Document>()
 private val jar_cache_dir = Paths.get(System.getProperty("user.home"), ".nob_cache").also { it.toFile().mkdirs() }
@@ -341,7 +354,7 @@ private fun collect_managed_versions(
                 val bom_doc = try {
                     download_pom(bom_lib)
                 } catch (e: Exception) {
-                    warn("failed to download BOM $bom_lib: ${e.message}, skipping")
+                    debug("failed to download BOM $bom_lib: ${e.message}, skipping")
                     continue
                 }
                 val bom_props = Properties.collect(bom_doc, bom_lib)
@@ -370,7 +383,8 @@ private fun print_tree(
             continue
         }
         first_parent[lib] = parent
-        println("$indent- $lib")
+        val lib_colorized = lib.toString().split(":").let { it.dropLast(1).joinToString(":") + ":" + color(it.last(), Color.magenta)}
+        println("$indent- $lib_colorized")
         runCatching { 
             resolve_transitive(listOf(lib))
                 .sortedWith(compareBy({ it.group_id }, { it.artifact_id }, { it.version })) 
@@ -405,26 +419,26 @@ fun resolve_transitive(
                     pom_file.writeText(xml)
                     downloaded
                 } catch (e: Exception) {
-                    warn("missing POM for $current and no network: ${e.message}")
+                    debug("missing POM for $current and no network: ${e.message}")
                     continue
                 }
             }
         } catch (e: Exception) {
-            warn("failed to download or parse POM $current: ${e.message}")
+            debug("failed to download or parse POM $current: ${e.message}")
             continue
         }
         // Collect managed versions from BOMs / parent POMs
         val managed_versions = try {
             collect_managed_versions(doc, current)
         } catch (e: Exception) {
-            warn("failed to collect managed versions for $current: ${e.message}")
+            debug("failed to collect managed versions for $current: ${e.message}")
             emptyMap()
         }
         global_managed_versions.putAll(managed_versions)
         val props = try {
             Properties.collect(doc, current)
         } catch (e: Exception) {
-            warn("failed to collect properties for $current: ${e.message}")
+            debug("failed to collect properties for $current: ${e.message}")
             emptyMap()
         }
         // Process declared dependencies
@@ -438,7 +452,7 @@ fun resolve_transitive(
             if (version == null) {
                 version = managed_versions[group_id to artifact_id]
                 if (version == null) {
-                    warn("no version for $group_id:$artifact_id, skipping")
+                    debug("no version for $group_id:$artifact_id, skipping")
                     continue
                 }
             }
@@ -660,8 +674,8 @@ private fun String.resolve_props(props: Map<String, String>, on_missing: (String
         props[match.groupValues[1]] ?: on_missing(match.groupValues[1]) 
     }
 
-private fun debug(msg: String) { if (DEBUG) println("[DEBUG] $msg") }
-private fun info(msg: String) { if (!DEBUG) println("[INFO] $msg") }
-private fun warn(msg: String) { if (DEBUG) println("[WARN] $msg") }
-private fun err(msg: String) { println("[ERR] $msg") }
+private fun debug(msg: String) { if (DEBUG) println("${color("[DEBUG]", Color.yellow)} $msg") }
+private fun info(msg: String) { println("${color("[INFO]", Color.cyan)} $msg") }
+private fun warn(msg: String) { println("${color("[WARN]", Color.magenta)} $msg") }
+private fun err(msg: String) { println("${color("[ERR]", Color.red)} $msg") }
 
