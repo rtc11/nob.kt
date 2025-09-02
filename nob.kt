@@ -25,23 +25,32 @@ import org.w3c.dom.Document
 import org.w3c.dom.Element
 import org.w3c.dom.NodeList
 
-const val DEBUG = true
+const val DEBUG = false
 
 private fun compile_target(opts: Opts): Int {
 
     val lib_tree = Nob.resolve_libs(
         Lib.of("io.ktor:ktor-server-netty:3.2.2"),
-        // Lib.of("io.ktor:ktor-server-core:3.2.2"),
     )
 
     val final_libs = resolve_conflicts(lib_tree).resolve_kotlin_libs(opts)
 
-    Nob.print_libs(lib_tree)
-    final_libs.forEach { lib -> info(lib.toString())}
+    // final_libs.forEach { info("[${it.scope}] [${it.type}] [${it}]") }
+
+    // Nob.print_libs(lib_tree)
+
+    // println(color("Runtime Libs:", Color.green))
+    // final_libs.filter{ lib -> lib.scope == "runtime"}.forEach { lib -> info("${lib}:${lib.scope}") }
+    // println(color("Compile Libs:", Color.green))
+    // final_libs.filter{ lib -> lib.scope == "compile"}.forEach { lib -> info("${lib}:${lib.scope}") }
 
     val opts = opts.copy(libs = final_libs)
 
+    // info("Compile classpath:")
     // info(opts.compile_classpath.replace(':', '\n'))
+    //
+    // info("Runtime classpath:")
+    // info(opts.runtime_classpath.replace(':', '\n'))
 
     var exit_code =  Nob.compile(opts, opts.src_file)
     if (exit_code == 0) exit_code = run_target(opts)
@@ -109,16 +118,24 @@ data class Lib(
     val type: String = "jar",
     val scope: String = "compile",
     val repo: String = "https://repo1.maven.org/maven2",
-    val jar_path: Path = jar_cache_dir.resolve(group_id).resolve("${artifact_id}_$version.jar")
+    val jar_path: Path = jar_cache_dir.resolve(group_id).resolve("${artifact_id}-$version.jar")
 ) {
     val base_url = "$repo/${group_id.replace('.', '/')}/$artifact_id" 
     val pom_url = "$base_url/$version/$artifact_id-$version.pom"
     val jar_url = "$base_url/$version/$artifact_id-$version.jar"
+    val module_url = "$base_url/$version/$artifact_id-$version.module"
     fun pom_path(): Path = jar_cache_dir.resolve(group_id).resolve("${artifact_id}_$version.pom")
-    val jar_file get() = File("${jar_cache_dir}/${group_id}/${artifact_id}_${version}.jar").also { it.parentFile.mkdirs() }
-    val pom_file get() = File("${jar_cache_dir}/${group_id}/${artifact_id}_${version}.pom").also { it.parentFile.mkdirs() }
+    val jar_file get() = File("${jar_cache_dir}/${group_id}/${artifact_id}-${version}.jar").also { it.parentFile.mkdirs() }
+    val pom_file get() = File("${jar_cache_dir}/${group_id}/${artifact_id}-${version}.pom").also { it.parentFile.mkdirs() }
+    val module_file get() = File("${jar_cache_dir}/${group_id}/${artifact_id}-${version}.module").also { it.parentFile.mkdirs() }
 
     override fun toString() = "$group_id:$artifact_id:$version"
+    override fun hashCode(): Int = "${toString()}:$scope".hashCode()
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is Lib) return false
+        return hashCode() == other.hashCode()
+    }
 
     companion object {
         fun of(str: String) = str.split(':').let { 
@@ -189,14 +206,17 @@ object Nob {
         val root = LibNode(Lib("root", "root", "0.0.0"))
         val resolved_libs = mutableMapOf<Pair<String, String>, LibNode>()
         libs.forEach { lib ->
-            val node = resolve_recursive(lib, resolved_libs)
+            resolve_recursive(lib, resolved_libs)
+        }
+        libs.forEach { lib ->
+            val node = resolved_libs[lib.group_id to lib.artifact_id]
             if (node != null) root.children.add(node)
         }
         return root
     }
 
     fun print_libs(root: LibNode) {
-        println(color("LIBS", Color.green))
+        println(color("Resolved Libs:", Color.green))
         print_recursive(root, "")
     }
 }
@@ -302,7 +322,9 @@ private fun resolve_conflicts(root: LibNode): Set<Lib> {
         val ga = lib.group_id to lib.artifact_id
         val existing_lib = resolved[ga]
         if (existing_lib == null || CompareVersion(lib.version.split("[.-]".toRegex())).compareTo(CompareVersion(existing_lib.version.split("[.-]".toRegex()))) > 0) {
-            resolved[ga] = lib
+            if (lib.group_id != "root" && lib.artifact_id != "root" && lib.version != "0.0.0") {
+                resolved[ga] = lib
+            }
         }
         node.children.forEach { child -> 
             if (visited.add(child)) {
@@ -310,25 +332,27 @@ private fun resolve_conflicts(root: LibNode): Set<Lib> {
             }
         }
     }
-    val final_libs = resolved.values.filter { download_jar(it) }.toSet()
-    return final_libs
+    return resolved.values.toSet()
 }
 
-private fun Set<Lib>.resolve_kotlin_libs(opts: Opts): Set<Lib> =
-    filterNot { it.group_id == "org.jetbrains.kotlin" && it.artifact_id == "kotlin-stdlib-common"}
-    .map { lib ->
-        if (lib.group_id == "org.jetbrains.kotlin") {
-            val local = opts.kotlin_lib.resolve("${lib.artifact_id}.jar")
-            if (local.toFile().exists()) {
-                lib.copy(version = opts.kotlin_target, jar_path = local)
-            } else {
-                err("dependent on ${lib.scope} lib $lib but it was not found in ${opts.kotlin_lib} with version ${opts.kotlin_target}, fallback to $lib")
-                lib // keep original if missing
+private fun Set<Lib>.resolve_kotlin_libs(opts: Opts): Set<Lib> {
+    return this
+        .filterNot { it.group_id == "org.jetbrains.kotlin" && it.artifact_id == "kotlin-stdlib-common" }
+        .map {
+            when (it.group_id) {
+                "org.jetbrains.kotlin" -> {
+                    val local = opts.kotlin_lib.resolve("${it.artifact_id}.jar")
+                    if (local.toFile().exists()) {
+                        it.copy(version = opts.kotlin_target, jar_path = local)
+                    } else {
+                        err("dependent on ${it.scope} lib $it but it was not found in ${opts.kotlin_lib} with version ${opts.kotlin_target}. Fallback to version ${it.version}")
+                        it // keep original if missing
+                    }
+                }
+                else -> it
             }
-        } else {
-            lib // keep non-kotlin libs
-        }
     }.toSet()
+}
 
 private fun color(text: Any, color: Color) = "${color.code}$text${Color.reset.code}" 
 private enum class Color(val code: String) {
@@ -343,59 +367,71 @@ private enum class Color(val code: String) {
 
 private fun print_recursive(node: LibNode, indent: String, visited: MutableSet<LibNode> = mutableSetOf()) {
     if (!visited.add(node)) {
-        println("${indent}[cycle detected] ${node.lib}")
+        println("${indent}${node.lib} (${node.lib.scope})")
         return
     }
-    println("${indent}${node.lib}")
-    node.children.forEach { child -> print_recursive(child, "$indent    ", visited) }
+    if (node.lib.group_id != "root") {
+        println("${indent}${node.lib} (${node.lib.scope}) ${color("+", Color.green)}")
+    }
+    node.children.forEach { child -> print_recursive(child, "$indent  ", visited) }
 }
 
 private fun resolve_recursive(
     lib: Lib,
     resolved_libs: MutableMap<Pair<String, String>, LibNode>,
-): LibNode? {
+) {
     debug("resolve $lib [ ]")
     val ga = lib.group_id to lib.artifact_id
     val existing_node = resolved_libs[ga]
-    if (existing_node != null) return existing_node
+    if (existing_node != null) return
+
     val node = LibNode(lib)
     resolved_libs[ga] = node
-    val pom = download_pom(lib) ?: return null
-    val props = pom.props(lib)
 
-    // Process parent POM first to inherit properties and managed dependencies
-    val parent_lib = parent(pom)
-    if (parent_lib != null) {
-        resolve_recursive(parent_lib, resolved_libs)
-        download_pom(parent_lib)?.let { parent_pom ->
-            val parent_props = parent_pom.props(parent_lib)
-            props.merge_props(parent_props)
+    fun resolve_gradle(): Set<Lib> {
+        return download_module(lib)
+    }
+
+    fun resolve_maven(): Set<Lib> {
+        if (true) {
+            warn("disable maven resolution")
+            return emptySet()
+        } 
+
+        val pom = download_pom(lib) ?: return emptySet()
+        val props = pom.props(lib)
+        val parent_lib = parent(pom)
+        if (parent_lib != null) {
+            resolve_recursive(parent_lib, resolved_libs)
+            download_pom(parent_lib)?.let { parent_pom ->
+                val parent_props = parent_pom.props(parent_lib)
+                props.merge_props(parent_props)
+            }
         }
+
+        debug("resolving managed dependencies [ ] ($lib)")
+        val boms_to_fetch = mutableSetOf<Lib>()
+        val managed = pom.managed(props, boms_to_fetch)
+        debug("resolving managed dependencies [X] ($lib)")
+
+        debug("resolving BOMs [ ] ($lib)")
+        boms_to_fetch.forEach { bom -> resolve_recursive(bom, resolved_libs) }
+        debug("resolving BOMs [X] ($lib)")
+
+        debug("resolving direct dependencies [ ] ($lib)")
+
+        return pom.deps(props, managed)
     }
 
-    // Get managed dependencies, including BOMs, from the current POM
-    val boms_to_fetch = mutableSetOf<Lib>()
-    debug("resolving managed dependencies [ ] ($lib)")
-    val managed = pom.managed(props, boms_to_fetch)
-    debug("resolving managed dependencies [X] ($lib)")
+    val direct_dependencies = resolve_gradle() ?: resolve_maven()
+    direct_dependencies.forEach { dep -> resolve_recursive(dep, resolved_libs) }
+    val transitive_dependencies = direct_dependencies.mapNotNull { resolved_libs[it.group_id to it.artifact_id] } 
+    node.children.addAll(transitive_dependencies)
 
-    // Process imported BOMs recursively
-    debug("resolving BOMs [ ] ($lib)")
-    boms_to_fetch.forEach { bom -> resolve_recursive(bom, resolved_libs) }
-    debug("resolving BOMs [X] ($lib)")
-
-    // Get the direct dependencies from the current POM, applying the full set of resolved properties and managed dependencies from the entire parent/BOM hierarchy.
-    debug("resolving direct dependencies [ ] ($lib)")
-    val direct_dependencies = pom.deps(props, managed)
-    direct_dependencies.forEach { dep -> 
-        val child_node = resolve_recursive(dep, resolved_libs)
-        if (child_node != null) node.children.add(child_node)
-    }
     debug("resolving direct dependencies [X] ($lib)")
 
     download_jar(lib)
     debug("resolve $lib [X]")
-    return node
 }
 
 private fun parent(doc: Document): Lib? {
@@ -460,20 +496,134 @@ private fun download_pom(lib: Lib): Document? {
     }
 }
 
+fun download_module(lib: Lib): Set<Lib> {
+    try {
+        val text = if (lib.module_file.exists()) {
+            lib.module_file.readText()
+                .also { debug("download ${lib.module_url} ${color("[CACHE]", Color.yellow)}") }
+        } else {
+            URI(lib.module_url).toURL().openStream().bufferedReader().use { it.readText() }
+                .also { lib.module_file.writeText(it) }
+                .also { debug("download ${lib.module_url} ${color("[OK]", Color.green)}") }
+        }
+
+        val parser = JsonParser(text)
+        val root = parser.parse() as Map<*, *>
+        val component = root["component"] as Map<*, *>
+        val component_group = component["group"] as String
+        // val component_module = component["module"] as String
+        // val component_version = component["version"] as String
+        val variants = root["variants"] as? List<*> ?: return emptySet()
+        val libs = mutableSetOf<Lib>()
+
+        variants.forEach { 
+            val variant = it as Map<*, *>
+            val attrs = (variant["attributes"] as? Map<*, *>)?.mapNotNull { attr ->
+                val key = attr.key as? String
+                val value = (attr.value as? String)
+                if (key != null && value != null) key to value else null
+            }?.toMap() ?: emptyMap()
+
+            if (attrs["org.jetbrains.kotlin.platform.type"] == "jvm" && attrs["org.gradle.category"] == "library") {
+                val deps = variant["dependencies"] as? List<*> ?: emptySet<Any?>()
+                val scope = when (val usage = attrs["org.gradle.usage"] as? String) {
+                    "java-api" -> "compile"
+                    "java-runtime" -> "runtime"
+                    null -> "compile"
+                    else -> "unknown"
+                }
+
+                val files = variant["files"] as? List<*> ?: emptyList<Any?>()
+                files.forEach { file_info -> 
+                    val file_map = file_info as? Map<*, *>
+                    if (file_map == null) return@forEach
+                    val file_name = file_info["name"] as? String
+                    val file_url = file_info["url"] as? String
+                    if (file_name != null && file_url != null) {
+                        download_file(
+                            url = URI(lib.module_url).resolve(file_url), 
+                            file = File("${jar_cache_dir}/${component_group}/${file_name}").also { it.parentFile.mkdirs() },
+                        )
+                    }
+                }
+
+                for(d in deps) {
+                    val dep = d as Map<*, *>
+                    val group = dep["group"] as String
+                    val module = dep["module"] as String
+                    val version_obj = dep["version"] as? Map<*, *> ?: emptyMap<String, Any?>()
+                    val version = listOf("requires", "strictly", "prefers")
+                        .firstNotNullOfOrNull { key -> version_obj[key] as? String }
+                        ?: "unspecified"
+
+                    val dep_attrs = (dep["attributes"] as? Map<*, *>)?.mapNotNull { dep_attr ->
+                        val key = dep_attr.key as? String
+                        val value = (dep_attr.value as? String)
+                        if (key != null && value != null) key to value else null
+                    }?.toMap() ?: emptyMap()
+
+                    val category = dep_attrs["org.gradle.category"] as? String  
+                    if (category == "platform") {
+                        debug("dependency $group:$module:$version:$scope had category $category, skipping.")
+                        continue
+                    }
+                    libs.add(Lib(group, module, version, scope = scope))
+
+                }
+                val avail = variant["available-at"] as? Map<*, *>
+                if (avail != null) {
+                    val group = avail["group"] as String
+                    val module = avail["module"] as String
+                    val version = avail["version"] as String
+                    libs.add(Lib(group, module, version, scope = scope))
+                }
+            }
+        }
+        debug("found ${libs.size} libs")
+        return libs
+    } catch (e: FileNotFoundException) {
+        debug("download ${lib.module_url} ${color("[FAIL]", Color.red)} - not found, skipping.")
+        return emptySet()
+    } catch (e: Exception) {
+        err("download ${lib.module_url} ${color("[FAIL]", Color.red)} ${e.message}")
+        return emptySet()
+    }
+}
+
+private fun download_file(url: URI, file: File) {
+    if (file.exists()) {
+        debug("download $url ${color("[CACHE]", Color.yellow)}")
+        return
+    }
+    try {
+        url.toURL().openStream().use { stream ->
+            stream.transferTo(Files.newOutputStream(file.toPath()))
+            info("download $url ${color("[OK]", Color.green)}")
+        }
+    } catch (e: FileNotFoundException) {
+        warn("download $url ${color("[FAIL]", Color.red)} - not found ${e.message}")
+    } catch (e: Exception) {
+        err("download $url ${color("[FAIL]", Color.red)} ${e.message}")
+    }
+}
+
 private fun download_jar(lib: Lib): Boolean {
-    if (lib.jar_file.exists()) return true
-    if (lib.type == "jar") return false
+    if (lib.jar_file.exists()) {
+        debug("download $lib ${color("[CACHE]", Color.yellow)}")
+        return true
+    }
+    if (lib.type != "jar") return false
     try {
         URI(lib.jar_url).toURL().openStream().use { stream ->
             stream.transferTo(Files.newOutputStream(lib.jar_file.toPath()))
-            info("[OK] download $lib")
+            info("download $lib ${color("[OK]", Color.green)}")
             return true
         }
     } catch (e: FileNotFoundException) {
-        warn("[FAIL] $lib not found: ${e.message}")
+        warn("download $lib ${color("[FAIL]", Color.red)} - not found ${e.message}")
         return false
     } catch (e: Exception) {
-        err("[FAIL] download $lib $e")
+        err("download $lib ${color("[FAIL]", Color.red)} ${e.message}")
         return false
     }
 }
@@ -667,3 +817,116 @@ private fun debug(msg: String) { if (DEBUG) println("${color("[DEBUG]", Color.ye
 private fun info(msg: String) { println("${color("[INFO]", Color.cyan)} $msg") }
 private fun warn(msg: String) { println("${color("[WARN]", Color.magenta)} $msg") }
 private fun err(msg: String) { println("${color("[ERR]", Color.red)} $msg") }
+
+class JsonParser(private val text: String) {
+    private var i = 0
+
+    fun parse(): Any? = parse_value().also { skip_whitespace() }
+
+    private fun parse_value(): Any? {
+        skip_whitespace()
+        return when (peek()) {
+            '{' -> parse_object()
+            '[' -> parse_array()
+            '"' -> parse_string()
+            in '0'..'9', '-' -> parse_number()
+            't' -> parse_literal("true", true)
+            'f' -> parse_literal("false", false)
+            'n' -> parse_literal("null", null)
+            else -> error("unexpected char '${peek()}' at $i")
+        }
+    }
+
+    private fun parse_object(): Map<String, Any?> {
+        expect('{')
+        val map = mutableMapOf<String, Any?>()
+        skip_whitespace()
+        if (peek() == '}') { i++; return map }
+        while(true) {
+            skip_whitespace()
+            val key = parse_string()
+            skip_whitespace(); 
+            expect(':')
+            val value = parse_value()
+            map[key] = value
+            skip_whitespace()
+            if (peek() == '}') { i++; break }
+            expect(',')
+        }
+        return map
+    }
+
+    private fun parse_array(): List<Any?> {
+        expect('[')
+        val list = mutableListOf<Any?>()
+        skip_whitespace()
+        if (peek() == ']') { i++; return list }
+        while(true) {
+            val value = parse_value()
+            list.add(value)
+            skip_whitespace()
+            if (peek() == ']') { i++; break }
+            expect(',')
+        }
+        return list
+    }
+
+    private fun parse_string(): String {
+        expect('"')
+        val sb = StringBuilder()
+        while(true) {
+            when (val c = text[i++]) {
+                '"' -> break
+                '\\' -> {
+                    sb.append(
+                        when(val escape = text[i++]) {
+                            '"', '\\', '/' -> escape
+                            'b' -> '\b'
+                            'n' -> '\n'
+                            'r' -> '\r'
+                            't' -> '\t'
+                            'f' -> '\u000C'
+                            'u' -> {
+                                val hex = text.substring(i, i + 4)
+                                i += 4
+                                hex.toInt(16).toChar()
+                            }
+                            else -> error("bad escape: $escape")
+                        }
+                    )
+                }
+                else -> sb.append(c)
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun parse_number(): Number {
+        val start = i
+        while (i < text.length && (text[i].isDigit() || text[i] in "-+eE.")) i++
+        val numStr = text.substring(start, i)
+        return if (numStr.contains('.') || numStr.contains('e') || numStr.contains('E')) {
+            numStr.toDouble()
+        } else {
+            numStr.toLong()
+        }
+    }
+
+    private fun parse_literal(lit: String, value: Any?): Any? {
+        require(text.startsWith(lit, i)) { "Expected $lit at $i" }
+        i += lit.length
+        return value
+    }
+
+    private fun skip_whitespace() {
+        while (i < text.length && text[i].isWhitespace()) i++
+    }
+
+    private fun expect(c: Char) {
+        if (peek() != c) error("Expected '$c' at $i but got '${peek()}'")
+        i++
+    }
+
+    private fun peek(): Char = if (i < text.length) text[i] else '\u0000'
+}
+
