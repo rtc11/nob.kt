@@ -35,7 +35,6 @@ fun main(args: Array<String>) {
     System.exit(exit_code)
 }
 
-
 class Nob(private val opts: Opts) {
     fun compile_self() {
         try {
@@ -62,7 +61,7 @@ class Nob(private val opts: Opts) {
     }
 
     fun run_target(): Int {
-        debug("Running ${opts.name(opts.src_file)}...")
+        debug("Running ${opts.src_file}")
         val main_class = opts.name(opts.src_file).replaceFirstChar { it.uppercase() } + "Kt"
         return exec(
             buildList {

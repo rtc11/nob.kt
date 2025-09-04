@@ -19,33 +19,35 @@ This will resolve necessary compile/runtime libraries from gradle and maven.
 
 Example:
 ```kotlin
-private fun compile_target(opts: Opts): Int {
-    val libs = solve_libs(opts, listOf(
+fun main(args: Array<String>) {
+    val opts = parse_args(args)
+    val libs = listOf(
         Lib.of("io.ktor:ktor-server-netty:3.2.2"),
-    )).map { it.lib }.resolve_kotlin_libs(opts)
-
-    val opts = opts.copy(libs = libs.toSet())
-
-    var exit_code =  Nob.compile(opts, opts.src_file)
-    if (exit_code == 0) exit_code = run_target(opts)
-    return exit_code
+        Lib.of("org.slf4j:slf4j-simple:2.0.17"),
+    )
+    val nob = Nob(opts.copy(libs = solve_libs(opts, libs)))
+    nob.compile_self()
+    var exit_code =  nob.compile(opts.src_file)
+    if (exit_code == 0) exit_code = nob.run_target()
+    System.exit(exit_code)
 }
 ```
 
 Update `Opts` to change main source file or other options:
 ```kotlin
 data class Opts(
-    val src_file: String = "your-main-file.kt",
+    val src_file: String = "main.kt",
     val nob_src_file: String = "nob.kt",
     val kotlin_lib: Path, 
-    val libs: Set<Lib> = emptySet(),
+    val libs: List<Lib> = emptyList(),
     val out_dir: String = "out",
     val jvm_target: Int = 21,
     val kotlin_target: String = "2.2.0",
-    val backend_threads: Int = 3,
+    val backend_threads: Int = 0, // run codegen with N thread per processor (Default 1)
     val verbose: Boolean = false,
-    val debug: Boolean = true,
+    val debug: Boolean = false,
     val error: Boolean = true,
-    val extra: Boolean = true,
+    val extra: Boolean = false,
+    var debugger: Boolean = false,
 )
 ```
