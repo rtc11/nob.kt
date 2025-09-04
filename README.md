@@ -10,8 +10,11 @@ This no-build library rebuild it self if changed and uses a Kotlin daemon for sp
 Make sure the KOTLIN_LIB path is correct.
 
 # Usage
-Update nob.kt inside `compile_target` to include necessary libs.
+Bootstrap nob.kt with `./nob`
 
+Compile and run with the same `./nob`
+
+Update nob.kt inside `compile_target` to include necessary libs.
 This will resolve necessary compile/runtime libraries from gradle and maven.
 
 Example:
