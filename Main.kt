@@ -1,6 +1,16 @@
-import nob.*
+import io.ktor.server.engine.*
+import io.ktor.server.netty.*
+import io.ktor.server.application.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
 
 fun main() {
-    Nob.print_tree(Lib.of("io.ktor:ktor-server-netty:3.2.2"))
-    println("hello world")
+    embeddedServer(Netty, port = 8080) {
+        routing {
+            get("/") {
+                call.respondText("Hello, world!")
+            }
+        }
+    }// .start(wait = true)
 }
+
