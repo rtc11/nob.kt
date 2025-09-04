@@ -26,6 +26,7 @@ private fun compile_target(opts: Opts): Int {
 
     val libs = solve_libs(opts, listOf(
         Lib.of("io.ktor:ktor-server-netty:3.2.2"),
+        Lib.of("org.slf4j:slf4j-simple:2.0.17"),
     )).map { it.lib }.resolve_kotlin_libs(opts)
 
     val opts = opts.copy(libs = libs.toSet())
@@ -49,7 +50,7 @@ data class Opts(
     val out_dir: String = "out",
     val jvm_target: Int = 21,
     val kotlin_target: String = "2.2.0",
-    val backend_threads: Int = 1, // run codegen with N thread per processor (Default 1)
+    val backend_threads: Int = 0, // run codegen with N thread per processor (Default 1)
     val verbose: Boolean = false,
     val debug: Boolean = false,
     val error: Boolean = true,
@@ -491,10 +492,12 @@ fun solve_libs(opts: Opts, libs: List<Lib>): List<ResolvedLib> {
     val resolved = mutableListOf<ResolvedLib>()
     read_cache(cache_file, resolved)
 
-    if (resolved.isEmpty()) {
+    val keys = resolved.map { LibKey(it.lib.group_id, it.lib.artifact_id) }.toMutableSet()
+    val missing_libs = libs.filter{ LibKey(it.group_id, it.artifact_id) !in keys }
+
+    if (missing_libs.isNotEmpty()) {
         val gradle_resolver = GradleResolver()
         val maven_resolver = MavenResolver()
-        val keys = mutableSetOf<LibKey>()
         val queue = ArrayDeque<Lib>()
 
         for (lib in libs) {
