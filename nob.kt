@@ -37,24 +37,38 @@ private fun compile_target(opts: Opts): Int {
 }
 
 fun main(args: Array<String>) {
-    val opts = Opts(kotlin_lib = args.get(0).let(Paths::get))
+    val opts = parse_args(args)
+    // val opts = Opts(kotlin_lib = args.get(0).let(Paths::get))
     compile_self(opts)
     System.exit(compile_target(opts))
 }
 
+private fun parse_args(args: Array<String>): Opts {
+    var pos = 0
+    var opts = Opts(kotlin_lib = args.get(pos++).let(Paths::get))
+    while(true) {
+        when (val arg = args.getOrNull(pos++)) {
+            "-debugger" -> opts.debugger = true
+            null -> break
+        }
+    }
+    return opts
+}
+
 data class Opts(
-    val src_file: String = "main.kt",
-    val nob_src_file: String = "nob.kt",
-    val kotlin_lib: Path, 
-    val libs: Set<Lib> = emptySet(),
-    val out_dir: String = "out",
-    val jvm_target: Int = 21,
-    val kotlin_target: String = "2.2.0",
-    val backend_threads: Int = 0, // run codegen with N thread per processor (Default 1)
-    val verbose: Boolean = false,
-    val debug: Boolean = false,
-    val error: Boolean = true,
-    val extra: Boolean = false,
+    var src_file: String = "main.kt",
+    var nob_src_file: String = "nob.kt",
+    var kotlin_lib: Path, 
+    var libs: Set<Lib> = emptySet(),
+    var out_dir: String = "out",
+    var jvm_target: Int = 21,
+    var kotlin_target: String = "2.2.0",
+    var backend_threads: Int = 0, // run codegen with N thread per processor (Default 1)
+    var verbose: Boolean = false,
+    var debug: Boolean = false,
+    var error: Boolean = true,
+    var extra: Boolean = false,
+    var debugger: Boolean = false,
 ) {
     val cwd: String = System.getProperty("user.dir")
     val target_dir: Path = Paths.get(cwd, out_dir).also { it.toFile().mkdirs() }
@@ -197,9 +211,16 @@ private fun compile_self(opts: Opts) {
 private fun run_target(opts: Opts): Int {
     debug("Running ${opts.name(opts.src_file)}...")
     val main_class = opts.name(opts.src_file).replaceFirstChar { it.uppercase() } + "Kt"
-
-    // warn("runtime classpath: ${opts.runtime_classpath}")
-    return exec(listOf("java", "-cp", opts.runtime_classpath, main_class), opts)
+    return exec(
+        buildList {
+            add("java")
+            if (opts.debugger) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
+            add("-cp")
+            add(opts.runtime_classpath)
+            add(main_class)
+        },
+        opts
+    )
 }
 
 private fun exec(cmd: List<String>, opts: Opts): Int {
@@ -221,7 +242,6 @@ private fun compile_with_daemon(opts: Opts, src_file: String): Int {
     val daemon_opts = DaemonOptions(verbose = opts.verbose)
     val daemon_jvm_opts = DaemonJVMOptions()
     val client_alive_file = File("${opts.out_dir}/.alive").apply { if (!exists()) createNewFile() }
-    // warn("compile classpath: ${opts.compile_classpath}")
 
     val args = mutableListOf(
         File(src_file).absolutePath,

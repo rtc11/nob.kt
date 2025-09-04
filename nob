@@ -2,7 +2,13 @@
 
 set -e
 
-KOTLIN_LIB="/opt/homebrew/Cellar/kotlin/2.2.0/libexec/lib"
+if [ -n "$KOTLIN_HOME" ]; then
+  KOTLIN_LIB="$KOTLIN_HOME/libexec/lib"
+else
+  echo "environment variable '\$KOTLIN_HOME' is missing" 
+fi
+
+KOTLIN_LIB="$KOTLIN_HOME/libexec/lib"
 LIBS="$KOTLIN_LIB/kotlin-stdlib.jar:$KOTLIN_LIB/kotlin-compiler.jar:$KOTLIN_LIB/kotlin-daemon-client.jar:/$KOTLIN_LIB/kotlin-daemon.jar"
 
 mkdir -p out/nob
@@ -12,4 +18,4 @@ if [ ! -f out/nob/NobKt.class ]; then
     kotlinc nob.kt -cp "$LIBS" -d out
 fi
 
-java -cp "out:$LIBS" nob.NobKt "$KOTLIN_LIB"
+java -cp "out:$LIBS" nob.NobKt "$KOTLIN_LIB" $@
