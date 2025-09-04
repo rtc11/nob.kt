@@ -22,25 +22,149 @@ import org.w3c.dom.Node
 
 const val DEBUG = false
 
-private fun compile_target(opts: Opts): Int {
-
-    val libs = solve_libs(opts, listOf(
-        Lib.of("io.ktor:ktor-server-netty:3.2.2"),
-        Lib.of("org.slf4j:slf4j-simple:2.0.17"),
-    )).map { it.lib }.resolve_kotlin_libs(opts)
-
-    val opts = opts.copy(libs = libs.toSet())
-
-    var exit_code =  Nob.compile(opts, opts.src_file)
-    if (exit_code == 0) exit_code = run_target(opts)
-    return exit_code
-}
-
 fun main(args: Array<String>) {
     val opts = parse_args(args)
-    // val opts = Opts(kotlin_lib = args.get(0).let(Paths::get))
-    compile_self(opts)
-    System.exit(compile_target(opts))
+    val libs = listOf(
+        Lib.of("io.ktor:ktor-server-netty:3.2.2"),
+        Lib.of("org.slf4j:slf4j-simple:2.0.17"),
+    )
+    val nob = Nob(opts.copy(libs = solve_libs(opts, libs)))
+    nob.compile_self()
+    var exit_code =  nob.compile(opts.src_file)
+    if (exit_code == 0) exit_code = nob.run_target()
+    System.exit(exit_code)
+}
+
+
+class Nob(private val opts: Opts) {
+    fun compile_self() {
+        try {
+            require(compile(opts.nob_src_file, backup = true) == 0) { "Failed to compile nob." }
+            val nob_class_name = opts.name(opts.nob_src_file).replaceFirstChar { it.uppercase() } + "Kt.class"
+            val nob_class_path = opts.target_dir.resolve("nob").resolve(nob_class_name)
+            require(Files.exists(nob_class_path)) { "$nob_class_path not found after compilation!"}
+        } catch(e: Exception) {
+            e.printStackTrace()
+            restore()
+        }
+    }
+
+    fun compile(src_file: String, backup: Boolean = false): Int {
+        val src = opts.src(src_file)
+        val main_class = opts.main_class(src_file)
+        val src_modified = Files.getLastModifiedTime(src).toInstant() 
+        val main_class_modified = if (Files.exists(main_class)) Files.getLastModifiedTime(main_class).toInstant() else Instant.EPOCH
+        if (src_modified > main_class_modified) {
+            if (backup) backup()
+            return compile_with_daemon(src_file) 
+        } 
+        return 0
+    }
+
+    fun run_target(): Int {
+        debug("Running ${opts.name(opts.src_file)}...")
+        val main_class = opts.name(opts.src_file).replaceFirstChar { it.uppercase() } + "Kt"
+        return exec(
+            buildList {
+                add("java")
+                if (opts.debugger) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
+                add("-cp")
+                add(opts.runtime_classpath)
+                add(main_class)
+            },
+            opts
+        )
+    }
+
+    fun release(): Int {
+        val opts = opts.copy(debug = false, error = true)
+        val name = opts.name(opts.src_file)
+        val cmd = listOf("jar", "cfe", "${name}.jar", "${name}Kt", "-C", "${opts.target_dir}", ".")
+        if (opts.verbose) info("$cmd")
+        info("package ${name}.jar")
+        return exec(cmd, opts)
+    }
+
+    fun backup() {
+        val main_class = opts.main_class(opts.nob_src_file).toFile()
+        if (main_class.exists()) {
+            debug("backup $main_class")
+            val backup = File(main_class.parentFile, main_class.name + ".bak")
+            main_class.copyTo(backup, overwrite = true)
+        }
+    }
+
+    fun restore() {
+        val main_class = opts.main_class(opts.nob_src_file).toFile()
+        val backup = File(main_class.parentFile, opts.name(opts.nob_src_file) + ".bak")
+        if (backup.exists()) {
+            debug("restoring $main_class")
+            backup.copyTo(main_class, overwrite = true) 
+        }
+    }
+
+    fun compile_with_daemon(src_file: String): Int {
+        val compiler_id = CompilerId.makeCompilerId(
+            Files.list(opts.kotlin_lib)
+                .filter { it.toString().endsWith(".jar") } 
+                .map { it.toFile() }
+                .toList()
+        )
+        val daemon_opts = DaemonOptions(verbose = opts.verbose)
+        val daemon_jvm_opts = DaemonJVMOptions()
+        val client_alive_file = File("${opts.out_dir}/.alive").apply { if (!exists()) createNewFile() }
+
+        val classpath = when (src_file){
+            opts.nob_src_file -> opts.nob_compile_classpath
+            else -> opts.compile_classpath
+        }
+
+        val args = mutableListOf(
+            File(src_file).absolutePath,
+            "-d", opts.target_dir.toString(),
+            "-jvm-target", opts.jvm_target.toString(),
+            "-Xbackend-threads=${opts.backend_threads}",
+            "-cp", classpath,
+        )
+        debug("kotlinc args: $args")
+        if (opts.verbose) args += "-verbose"
+        if (opts.debug) args += "-Xdebug"
+        if (opts.extra) args += "-Wextra"
+        if (opts.error) args += "-Werror"
+
+        val daemon_reports = arrayListOf<DaemonReportMessage>()
+
+        val daemon = KotlinCompilerClient.connectToCompileService(
+            compilerId = compiler_id,
+            clientAliveFlagFile = client_alive_file,
+            daemonJVMOptions = daemon_jvm_opts,
+            daemonOptions = daemon_opts,
+            reportingTargets = DaemonReportingTargets(out = if (opts.verbose) System.out else null, messages = daemon_reports),
+            autostart = true,
+        ) ?: error("unable to connect to compiler daemon: " + 
+            daemon_reports.joinToString("\n  ", prefix = "\n  ") { 
+                "${it.category.name} ${it.message}"
+            })
+
+        val session_id = daemon.leaseCompileSession(client_alive_file.absolutePath).get()
+        try {
+            val start_time = System.nanoTime()
+            val exit_code = KotlinCompilerClient.compile(
+                compilerService = daemon,
+                sessionId = session_id,
+                targetPlatform = CompileService.TargetPlatform.JVM,
+                args = args.toTypedArray(),
+                messageCollector = PrintingMessageCollector(System.err, MessageRenderer.WITHOUT_PATHS, true),
+                compilerMode = CompilerMode.NON_INCREMENTAL_COMPILER,
+                reportSeverity = ReportSeverity.INFO,
+            )
+            val end_time = System.nanoTime()
+            info("Compiled $src_file in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
+            return exit_code
+        } finally {
+            daemon.releaseCompileSession(session_id) 
+        }
+    }
 }
 
 private fun parse_args(args: Array<String>): Opts {
@@ -56,25 +180,23 @@ private fun parse_args(args: Array<String>): Opts {
 }
 
 data class Opts(
-    var src_file: String = "main.kt",
-    var nob_src_file: String = "nob.kt",
-    var kotlin_lib: Path, 
-    var libs: Set<Lib> = emptySet(),
-    var out_dir: String = "out",
-    var jvm_target: Int = 21,
-    var kotlin_target: String = "2.2.0",
-    var backend_threads: Int = 0, // run codegen with N thread per processor (Default 1)
-    var verbose: Boolean = false,
-    var debug: Boolean = false,
-    var error: Boolean = true,
-    var extra: Boolean = false,
+    val src_file: String = "main.kt",
+    val nob_src_file: String = "nob.kt",
+    val kotlin_lib: Path, 
+    val libs: List<Lib> = emptyList(),
+    val out_dir: String = "out",
+    val jvm_target: Int = 21,
+    val kotlin_target: String = "2.2.0",
+    val backend_threads: Int = 0, // run codegen with N thread per processor (Default 1)
+    val verbose: Boolean = false,
+    val debug: Boolean = false,
+    val error: Boolean = true,
+    val extra: Boolean = false,
     var debugger: Boolean = false,
 ) {
     val cwd: String = System.getProperty("user.dir")
     val target_dir: Path = Paths.get(cwd, out_dir).also { it.toFile().mkdirs() }
 
-    // TODO: Do I need to include kotlin-stdlib and/or others if missing? 
-    //       Are they always required but not always a transitive dependency?
     val runtime_classpath: String = (
         libs.filter { it.scope == "runtime" || it.scope == "compile" }.map { it.jar_path } + 
         listOf(target_dir)
@@ -84,12 +206,17 @@ data class Opts(
         libs.filter { it.scope == "compile" }.map { it.jar_path } + 
         listOf("kotlin-stdlib.jar", "kotlin-compiler.jar", "kotlin-daemon.jar", "kotlin-daemon-client.jar").map { kotlin_lib.resolve(it)} + 
         listOf(target_dir)
-    ).map { it.toAbsolutePath().normalize().toString() }
-    .toSet()
-    .joinToString(File.pathSeparator)
+    ).map { it.toAbsolutePath().normalize().toString() }.toSet().joinToString(File.pathSeparator)
+
+    val nob_compile_classpath: String = (
+        libs.filter { it.scope == "lol" }.map { it.jar_path } + 
+        listOf("kotlin-stdlib.jar", "kotlin-compiler.jar", "kotlin-daemon.jar", "kotlin-daemon-client.jar").map { kotlin_lib.resolve(it)} + 
+        listOf(target_dir)
+    ).map { it.toAbsolutePath().normalize().toString() }.toSet().joinToString(File.pathSeparator)
 
     fun name(src_file: String) = src_file.removeSuffix(".kt").lowercase()
     fun src(src_file: String): Path = Paths.get(cwd, src_file).normalize()
+    fun main_path(src_file: String): Path = Paths.get(cwd, src_file)
     fun main_class(src_file: String): Path { 
         val src = src(src_file).toFile()
         val pkg = src.useLines { lines -> lines.firstOrNull { it.trim().startsWith("package ") }?.removePrefix("package ")?.trim() }
@@ -99,7 +226,6 @@ data class Opts(
             else -> target_dir.resolve(pkg.replace('.', '/')).resolve(class_name)
         }
     }
-    fun main_path(src_file: String): Path = Paths.get(cwd, src_file)
 }
 
 private val jar_cache_dir = Paths.get(System.getProperty("user.home"), ".nob_cache").also { it.toFile().mkdirs() }
@@ -142,87 +268,6 @@ data class Lib(
     }
 }
 
-data class LibNode(val lib: Lib, val children: MutableList<LibNode> = mutableListOf()) {
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is LibNode) return false
-        return lib == other.lib
-    }
-    override fun hashCode(): Int = lib.hashCode()
-}
-
-object Nob {
-    fun release(opts: Opts): Int {
-        val opts = opts.copy(debug = false, error = true)
-        val name = opts.name(opts.src_file)
-        val cmd = listOf("jar", "cfe", "${name}.jar", "${name}Kt", "-C", "${opts.target_dir}", ".")
-        if (opts.verbose) info("$cmd")
-        info("package ${name}.jar")
-        return exec(cmd, opts)
-    }
-
-    fun compile(
-        opts: Opts,
-        src_file: String,
-        backup: Boolean = false,
-    ): Int {
-        val src = opts.src(src_file)
-        val main_class = opts.main_class(src_file)
-        val src_modified = Files.getLastModifiedTime(src).toInstant() 
-        val main_class_modified = if (Files.exists(main_class)) Files.getLastModifiedTime(main_class).toInstant() else Instant.EPOCH
-        if (src_modified > main_class_modified) {
-            if (backup) backup(opts)
-            return compile_with_daemon(opts, src_file) 
-        } 
-        return 0
-    }
-
-    fun backup(opts: Opts) {
-        val main_class = opts.main_class(opts.nob_src_file).toFile()
-        if (main_class.exists()) {
-            debug("backup $main_class")
-            val backup = File(main_class.parentFile, main_class.name + ".bak")
-            main_class.copyTo(backup, overwrite = true)
-        }
-    }
-
-    fun restore(opts: Opts) {
-        val main_class = opts.main_class(opts.nob_src_file).toFile()
-        val backup = File(main_class.parentFile, opts.name(opts.nob_src_file) + ".bak")
-        if (backup.exists()) {
-            debug("restoring $main_class")
-            backup.copyTo(main_class, overwrite = true) 
-        }
-    }
-}
-
-private fun compile_self(opts: Opts) {
-    try {
-        require(Nob.compile(opts, opts.nob_src_file, backup = true) == 0) { "Failed to compile nob." }
-        val nob_class_name = opts.name(opts.nob_src_file).replaceFirstChar { it.uppercase() } + "Kt.class"
-        val nob_class_path = opts.target_dir.resolve("nob").resolve(nob_class_name)
-        require(Files.exists(nob_class_path)) { "$nob_class_path not found after compilation!"}
-    } catch(e: Exception) {
-        e.printStackTrace()
-        Nob.restore(opts)
-    }
-}
-
-private fun run_target(opts: Opts): Int {
-    debug("Running ${opts.name(opts.src_file)}...")
-    val main_class = opts.name(opts.src_file).replaceFirstChar { it.uppercase() } + "Kt"
-    return exec(
-        buildList {
-            add("java")
-            if (opts.debugger) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
-            add("-cp")
-            add(opts.runtime_classpath)
-            add(main_class)
-        },
-        opts
-    )
-}
-
 private fun exec(cmd: List<String>, opts: Opts): Int {
     if (opts.verbose) info("exec: $cmd")
     val builder = ProcessBuilder(cmd)
@@ -232,62 +277,78 @@ private fun exec(cmd: List<String>, opts: Opts): Int {
     return process.waitFor()
 }
 
-private fun compile_with_daemon(opts: Opts, src_file: String): Int {
-    val compiler_id = CompilerId.makeCompilerId(
-        Files.list(opts.kotlin_lib)
-            .filter { it.toString().endsWith(".jar") } 
-            .map { it.toFile() }
-            .toList()
-    )
-    val daemon_opts = DaemonOptions(verbose = opts.verbose)
-    val daemon_jvm_opts = DaemonJVMOptions()
-    val client_alive_file = File("${opts.out_dir}/.alive").apply { if (!exists()) createNewFile() }
 
-    val args = mutableListOf(
-        File(src_file).absolutePath,
-        "-d", opts.target_dir.toString(),
-        "-jvm-target", opts.jvm_target.toString(),
-        "-Xbackend-threads=${opts.backend_threads}",
-        "-cp", opts.compile_classpath,
-    )
-    // info("kotlinc args: $args")
-    if (opts.verbose) args += "-verbose"
-    if (opts.debug) args += "-Xdebug"
-    if (opts.extra) args += "-Wextra"
-    if (opts.error) args += "-Werror"
-
-    val daemon_reports = arrayListOf<DaemonReportMessage>()
-
-    val daemon = KotlinCompilerClient.connectToCompileService(
-        compilerId = compiler_id,
-        clientAliveFlagFile = client_alive_file,
-        daemonJVMOptions = daemon_jvm_opts,
-        daemonOptions = daemon_opts,
-        reportingTargets = DaemonReportingTargets(out = if (opts.verbose) System.out else null, messages = daemon_reports),
-        autostart = true,
-    ) ?: error("unable to connect to compiler daemon: " + 
-        daemon_reports.joinToString("\n  ", prefix = "\n  ") { 
-            "${it.category.name} ${it.message}"
-        })
-
-    val session_id = daemon.leaseCompileSession(client_alive_file.absolutePath).get()
-    try {
-        val start_time = System.nanoTime()
-        val exit_code = KotlinCompilerClient.compile(
-            compilerService = daemon,
-            sessionId = session_id,
-            targetPlatform = CompileService.TargetPlatform.JVM,
-            args = args.toTypedArray(),
-            messageCollector = PrintingMessageCollector(System.err, MessageRenderer.WITHOUT_PATHS, true),
-            compilerMode = CompilerMode.NON_INCREMENTAL_COMPILER,
-            reportSeverity = ReportSeverity.INFO,
-        )
-        val end_time = System.nanoTime()
-        info("Compiled $src_file in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
-        return exit_code
-    } finally {
-        daemon.releaseCompileSession(session_id) 
+private fun download_file(url: URI, file: File) {
+    if (file.exists()) {
+        debug("download $url ${color("[CACHE]", Color.yellow)}")
+        return
     }
+    try {
+        url.toURL().openStream().use { stream ->
+            stream.transferTo(Files.newOutputStream(file.toPath()))
+            info("download $url ${color("[OK]", Color.green)}")
+        }
+    } catch (e: FileNotFoundException) {
+        warn("download $url ${color("[FAIL]", Color.red)} - not found ${e.message}")
+    } catch (e: Exception) {
+        err("download $url ${color("[FAIL]", Color.red)} ${e.message}")
+    }
+}
+
+private fun download_jar(lib: Lib) {
+    if (lib.type != "jar") return
+    download_file(URI(lib.jar_url),lib.jar_file)
+}
+
+data class ResolvedLib(val lib: Lib, val resolved_from: String)
+data class LibKey(val group: String, val artifact: String)
+
+private fun solve_libs(opts: Opts, libs: List<Lib>): List<Lib> {
+    val start_time = System.nanoTime()
+    val cache_file = opts.target_dir.resolve("libs.cache").toFile()
+    val resolved = mutableListOf<ResolvedLib>()
+    read_cache(cache_file, resolved)
+
+    val keys = resolved.map { LibKey(it.lib.group_id, it.lib.artifact_id) }.toMutableSet()
+    val missing_libs = libs.filter{ LibKey(it.group_id, it.artifact_id) !in keys }
+
+    if (missing_libs.isNotEmpty()) {
+        val gradle_resolver = GradleResolver()
+        val maven_resolver = MavenResolver()
+        val queue = ArrayDeque<Lib>()
+
+        for (lib in libs) {
+            val key = LibKey(lib.group_id, lib.artifact_id)
+            if (key !in keys) {
+                resolved.add(ResolvedLib(lib, "local"))
+                keys.add(key)
+                queue.add(lib)
+                download_jar(lib)
+            }
+        }
+
+        while(queue.isNotEmpty()) {
+            val lib = queue.poll()
+            debug("resolve: $lib")
+            gradle_resolver.solve_deps(lib)
+                .ifEmpty { maven_resolver.solve_deps(lib) }
+                .forEach { dep ->
+                    val key = LibKey(dep.lib.group_id, dep.lib.artifact_id)
+                    if (key !in keys) {
+                        resolved.add(dep)
+                        keys.add(key)
+                        queue.add(dep.lib)
+                        download_jar(dep.lib)
+                    }
+                }
+        }
+
+        save_cache(cache_file, resolved)
+    }
+
+    val end_time = System.nanoTime()
+    info("Resolved ${resolved.size} libs in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
+    return resolved.map { it.lib }.resolve_kotlin_libs(opts)
 }
 
 private fun List<Lib>.resolve_kotlin_libs(opts: Opts): List<Lib> {
@@ -309,63 +370,23 @@ private fun List<Lib>.resolve_kotlin_libs(opts: Opts): List<Lib> {
     }
 }
 
-private fun color(text: Any, color: Color) = "${color.code}$text${Color.reset.code}" 
-private enum class Color(val code: String) {
-    reset("\u001B[0m"),
-    red("\u001B[31m"),
-    green("\u001B[32m"),
-    yellow("\u001B[33m"),
-    blue("\u001B[34m"),
-    magenta("\u001B[35m"),
-    cyan("\u001B[36m")
+private fun read_cache(file: File, resolved: MutableList<ResolvedLib>) {
+    if (!file.exists()) return
+    file.readLines()
+        .mapNotNull { line -> 
+            val parts = line.split(":")
+            if (parts.size != 6) null
+            ResolvedLib(
+                resolved_from = parts[5],
+                lib = Lib(group_id = parts[0], artifact_id = parts[1], version = parts[2], scope = parts[3], type = parts[4]), 
+            )
+        }.forEach(resolved::add)
 }
 
-private val problematic_html_entities = mapOf(
-    "&oslash;" to "ø", 
-    "&Oslash;" to "Ø",
-    "&auml;" to "ä",
-    "&ouml;" to "ö",
-    "&uuml;" to "ü",
-    "&Auml;" to "Ä",
-    "&Ouml;" to "Ö",
-    "&Uuml;" to "Ü",
-    "&apos;" to "'"
-)
-
-private fun String.sanitize(): String = problematic_html_entities.entries
-    .fold(this) { acc, (k, v) -> acc.replace(k, v) }  
-    .replace(Regex("<[^>]*@[^>]*>"), "") // remove <abc@abc>
-    .replace(Regex("&(?!amp;)(?!lt;)(?!gt;)(?!quot;)(?!apos;).+;"), "") // remove malformed tags
-
-private fun download_pom(lib: Lib): Document? {
-    fun document(text: String) = DocumentBuilderFactory.newInstance()
-        .apply { 
-            setFeature("http://xml.org/sax/features/external-general-entities", false)
-            setFeature("http://xml.org/sax/features/external-parameter-entities", false)
-            setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
-            isNamespaceAware = true
-        }
-        .newDocumentBuilder()
-        .parse(text.byteInputStream())
-        .apply { documentElement.normalize() }
-
-
-    try {
-        if (lib.pom_file.exists()) {
-            return document(lib.pom_file.readText().sanitize())
-                .also { debug("download ${lib.pom_url} ${color("[CACHE]", Color.yellow)}") }
-        }
-        val text = URI(lib.pom_url).toURL().openStream().bufferedReader().use { it.readText() }.sanitize()
-        lib.pom_file.writeText(text)
-        return document(text)
-            .also { info("download ${lib.pom_url} ${color("[OK]", Color.green)}") }
-    } catch (e: FileNotFoundException) {
-        debug("download ${lib.pom_url} ${color("[FAIL]", Color.red)} - not found, skipping.")
-        return null
-    } catch (e: Exception) {
-        err("download ${lib.pom_url} ${color("[FAIL]", Color.red)} ${e.message}")
-        return null
-    }
+private fun save_cache(file: File, resolved: List<ResolvedLib>) {
+    file.writeText(resolved.joinToString("\n") {
+        "${it.lib}:${it.lib.scope}:${it.lib.type}:${it.resolved_from}"
+    })
 }
 
 class GradleResolver {
@@ -463,114 +484,6 @@ class GradleResolver {
             null
         }
     }
-}
-
-private fun download_file(url: URI, file: File) {
-    if (file.exists()) {
-        debug("download $url ${color("[CACHE]", Color.yellow)}")
-        return
-    }
-    try {
-        url.toURL().openStream().use { stream ->
-            stream.transferTo(Files.newOutputStream(file.toPath()))
-            info("download $url ${color("[OK]", Color.green)}")
-        }
-    } catch (e: FileNotFoundException) {
-        warn("download $url ${color("[FAIL]", Color.red)} - not found ${e.message}")
-    } catch (e: Exception) {
-        err("download $url ${color("[FAIL]", Color.red)} ${e.message}")
-    }
-}
-
-private fun download_jar(lib: Lib): Boolean {
-    if (lib.jar_file.exists()) {
-        debug("download $lib ${color("[CACHE]", Color.yellow)}")
-        return true
-    }
-    if (lib.type != "jar") return false
-    try {
-        URI(lib.jar_url).toURL().openStream().use { stream ->
-            stream.transferTo(Files.newOutputStream(lib.jar_file.toPath()))
-            info("download $lib ${color("[OK]", Color.green)}")
-            return true
-        }
-    } catch (e: FileNotFoundException) {
-        warn("download $lib ${color("[FAIL]", Color.red)} - not found ${e.message}")
-        return false
-    } catch (e: Exception) {
-        err("download $lib ${color("[FAIL]", Color.red)} ${e.message}")
-        return false
-    }
-}
-
-data class ResolvedLib(val lib: Lib, val resolved_from: String)
-data class LibKey(val group: String, val artifact: String)
-
-fun solve_libs(opts: Opts, libs: List<Lib>): List<ResolvedLib> {
-    val start_time = System.nanoTime()
-    val cache_file = opts.target_dir.resolve("libs.cache").toFile()
-    val resolved = mutableListOf<ResolvedLib>()
-    read_cache(cache_file, resolved)
-
-    val keys = resolved.map { LibKey(it.lib.group_id, it.lib.artifact_id) }.toMutableSet()
-    val missing_libs = libs.filter{ LibKey(it.group_id, it.artifact_id) !in keys }
-
-    if (missing_libs.isNotEmpty()) {
-        val gradle_resolver = GradleResolver()
-        val maven_resolver = MavenResolver()
-        val queue = ArrayDeque<Lib>()
-
-        for (lib in libs) {
-            val key = LibKey(lib.group_id, lib.artifact_id)
-            if (key !in keys) {
-                resolved.add(ResolvedLib(lib, "local"))
-                keys.add(key)
-                queue.add(lib)
-                download_jar(lib)
-            }
-        }
-
-        while(queue.isNotEmpty()) {
-            val lib = queue.poll()
-            debug("resolve: $lib")
-            gradle_resolver.solve_deps(lib)
-                .ifEmpty { maven_resolver.solve_deps(lib) }
-                .forEach { dep ->
-                    val key = LibKey(dep.lib.group_id, dep.lib.artifact_id)
-                    if (key !in keys) {
-                        resolved.add(dep)
-                        keys.add(key)
-                        queue.add(dep.lib)
-                        download_jar(dep.lib)
-                    }
-                }
-        }
-
-        save_cache(cache_file, resolved)
-    }
-
-    val end_time = System.nanoTime()
-    info("Resolved ${resolved.size} libs in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
-    return resolved
-}
-
-private fun read_cache(file: File, resolved: MutableList<ResolvedLib>) {
-    if (!file.exists()) return
-    file.readLines()
-        .mapNotNull { line -> 
-            val parts = line.split(":")
-            if (parts.size != 6) null
-            ResolvedLib(
-                resolved_from = parts[5],
-                lib = Lib(group_id = parts[0], artifact_id = parts[1], version = parts[2], scope = parts[3], type = parts[4]), 
-            )
-        }.forEach(resolved::add)
-}
-
-private fun save_cache(file: File, resolved: List<ResolvedLib>) {
-    file.writeText(resolved.joinToString("\n") {
-        "${it.lib}:${it.lib.scope}:${it.lib.type}:${it.resolved_from}"
-    })
 }
 
 class MavenResolver {
@@ -744,6 +657,54 @@ class MavenResolver {
         val version = project["version"] ?: pom["parent"]["version"]!!
         return Lib(groupId, artifactId, version, type = "pom")
     }
+
+    private val problematic_html_entities = mapOf(
+        "&oslash;" to "ø", 
+        "&Oslash;" to "Ø",
+        "&auml;" to "ä",
+        "&ouml;" to "ö",
+        "&uuml;" to "ü",
+        "&Auml;" to "Ä",
+        "&Ouml;" to "Ö",
+        "&Uuml;" to "Ü",
+        "&apos;" to "'"
+    )
+
+    private fun String.sanitize(): String = problematic_html_entities.entries
+        .fold(this) { acc, (k, v) -> acc.replace(k, v) }  
+        .replace(Regex("<[^>]*@[^>]*>"), "") // remove <abc@abc>
+        .replace(Regex("&(?!amp;)(?!lt;)(?!gt;)(?!quot;)(?!apos;).+;"), "") // remove malformed tags
+
+    private fun download_pom(lib: Lib): Document? {
+        fun document(text: String) = DocumentBuilderFactory.newInstance()
+            .apply { 
+                setFeature("http://xml.org/sax/features/external-general-entities", false)
+                setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+                setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
+                isNamespaceAware = true
+            }
+            .newDocumentBuilder()
+            .parse(text.byteInputStream())
+            .apply { documentElement.normalize() }
+
+
+        try {
+            if (lib.pom_file.exists()) {
+                return document(lib.pom_file.readText().sanitize())
+                    .also { debug("download ${lib.pom_url} ${color("[CACHE]", Color.yellow)}") }
+            }
+            val text = URI(lib.pom_url).toURL().openStream().bufferedReader().use { it.readText() }.sanitize()
+            lib.pom_file.writeText(text)
+            return document(text)
+                .also { info("download ${lib.pom_url} ${color("[OK]", Color.green)}") }
+        } catch (e: FileNotFoundException) {
+            debug("download ${lib.pom_url} ${color("[FAIL]", Color.red)} - not found, skipping.")
+            return null
+        } catch (e: Exception) {
+            err("download ${lib.pom_url} ${color("[FAIL]", Color.red)} ${e.message}")
+            return null
+        }
+    }
 }
 
 operator fun Document.get(tag_name: String): Element {
@@ -771,6 +732,18 @@ fun debug(msg: String) { if (DEBUG) println("${color("[DEBUG]", Color.yellow)} $
 fun info(msg: String) { println("${color("[INFO]", Color.cyan)} $msg") }
 fun warn(msg: String) { println("${color("[WARN]", Color.magenta)} $msg") }
 fun err(msg: String) { println("${color("[ERR]", Color.red)} $msg") }
+
+private fun color(text: Any, color: Color) = "${color.code}$text${Color.reset.code}" 
+
+private enum class Color(val code: String) {
+    reset("\u001B[0m"),
+    red("\u001B[31m"),
+    green("\u001B[32m"),
+    yellow("\u001B[33m"),
+    blue("\u001B[34m"),
+    magenta("\u001B[35m"),
+    cyan("\u001B[36m")
+}
 
 class JsonParser(private val text: String) {
     private var i = 0

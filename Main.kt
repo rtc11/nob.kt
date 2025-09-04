@@ -4,13 +4,16 @@ import io.ktor.server.application.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 
-fun main() {
+fun main(args: Array<String>) {
+    println("a")
+    println("b")
+    println("c")
     embeddedServer(Netty, port = 8080) {
         routing {
             get("/") {
                 call.respondText("Hello, world!")
             }
         }
-    }// .start(wait = true)
+    }//.start(wait = true)
 }
 
