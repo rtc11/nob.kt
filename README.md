@@ -10,24 +10,39 @@ This no-build library rebuild it self if changed and uses a Kotlin daemon for sp
 Make sure the KOTLIN_LIB path is correct.
 
 # Usage
-Bootstrap nob for the first time, and compile Main.kt
-> ./nob
+Update nob.kt inside `compile_target` to include necessary libs.
 
-Recompile changes in nob.kt or Main.kt
-> ./nob
+This will resolve necessary compile/runtime libraries from gradle and maven.
 
-Download and cache dependencies:
-
-Update nob.kt
+Example:
 ```kotlin
-val deps = DepResolution.resolve_with_cache(
-    listOf(
-        Dep.of("io.ktor:ktor-server-netty:3.2.2"),
-        Dep.of("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2"),
-    )
-)
-val opts = Opts(libs = listOf(deps.map { it.jar_path() }))
-Nob.compile(opts)
+private fun compile_target(opts: Opts): Int {
+    val libs = solve_libs(opts, listOf(
+        Lib.of("io.ktor:ktor-server-netty:3.2.2"),
+    )).map { it.lib }.resolve_kotlin_libs(opts)
+
+    val opts = opts.copy(libs = libs.toSet())
+
+    var exit_code =  Nob.compile(opts, opts.src_file)
+    if (exit_code == 0) exit_code = run_target(opts)
+    return exit_code
+}
 ```
 
-
+Update `Opts` to change main source file or other options:
+```kotlin
+data class Opts(
+    val src_file: String = "your-main-file.kt",
+    val nob_src_file: String = "nob.kt",
+    val kotlin_lib: Path, 
+    val libs: Set<Lib> = emptySet(),
+    val out_dir: String = "out",
+    val jvm_target: Int = 21,
+    val kotlin_target: String = "2.2.0",
+    val backend_threads: Int = 3,
+    val verbose: Boolean = false,
+    val debug: Boolean = true,
+    val error: Boolean = true,
+    val extra: Boolean = true,
+)
+```
