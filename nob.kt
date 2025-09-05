@@ -22,14 +22,38 @@ import org.w3c.dom.Node
 
 const val DEBUG = false
 
+private fun rebuild_urself(args: Array<String>) {
+    val opts = parse_args(args)
+    val nob = Nob(opts)
+    val nob_class_file = File(opts.main_class(opts.nob_src.toFile()).split(".").fold(opts.target_dir) { acc, next -> acc.resolve(next) }.toString() + ".class")
+    // val nob_class_file = opts.main_class(opts.nob_src.toFile()).split(".").fold(opts.target_dir) { acc, next -> acc.resolve(next) }.resolve(".class").toFile()
+
+    if (opts.nob_src.toFile().exists() && nob_class_file.exists() && opts.nob_src.toFile().lastModified() > nob_class_file.lastModified()) {
+        // recompile self
+        val exit_code = nob.compile(opts.nob_src.toFile())
+
+        // Re-execute with the new class
+        ProcessBuilder(
+            "java",
+            "-cp", "out:${System.getProperty("java.class.path")}",
+            "nob.NobKt",
+            *args
+        ).inheritIO().start().waitFor()
+
+        // Exit this process to prevent running the outdated version
+        System.exit(exit_code)
+    }
+}
+
 fun main(args: Array<String>) {
+    rebuild_urself(args)
+
     val opts = parse_args(args)
     val libs = listOf(
         Lib.of("io.ktor:ktor-server-netty:3.2.2"),
         Lib.of("org.slf4j:slf4j-simple:2.0.17"),
     )
     val nob = Nob(opts.copy(libs = solve_libs(opts, libs)))
-    nob.compile(opts.nob_src.toFile())
     var exit_code =  nob.compile(opts.src_dir.toFile())
     if (exit_code == 0) exit_code = nob.run_target()
     System.exit(exit_code)
@@ -145,7 +169,7 @@ data class Opts(
     val cwd: String = System.getProperty("user.dir"),
     val src_dir: Path = Paths.get(cwd, "example").also { it.toFile().mkdirs() },
     val target_dir: Path = Paths.get(cwd, "out").also { it.toFile().mkdirs() },
-    val kotlin_dir: Path = Paths.get(System.getProperty("KOTLIN_HOME"), "libexec/lib"),
+    val kotlin_dir: Path = Paths.get(System.getProperty("KOTLIN_HOME"), "libexec", "lib"), // TODO: default not working
     val nob_src: Path = Paths.get(cwd, "nob.kt"),
 
     val libs: List<Lib> = emptyList(),

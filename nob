@@ -2,10 +2,9 @@
 
 set -e
 
-if [ -n "$KOTLIN_HOME" ]; then
-  KOTLIN_LIB="$KOTLIN_HOME/libexec/lib"
-else
-  echo "environment variable '\$KOTLIN_HOME' is missing" 
+if [ -z "$KOTLIN_HOME" ]; then
+    echo "environment variable '$KOTLIN_HOME' is missing" 
+    exit 1
 fi
 
 KOTLIN_LIB="$KOTLIN_HOME/libexec/lib"
@@ -14,7 +13,7 @@ LIBS="$KOTLIN_LIB/kotlin-stdlib.jar:$KOTLIN_LIB/kotlin-compiler.jar:$KOTLIN_LIB/
 mkdir -p out/nob
 
 if [ ! -f out/nob/NobKt.class ]; then
-    echo "[INFO] bootstrapping nob.kt -> class files"
+    echo "[INFO] bootstrapping nob.kt"
     kotlinc nob.kt -cp "$LIBS" -d out
 fi
 
