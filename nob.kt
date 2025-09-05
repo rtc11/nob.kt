@@ -22,38 +22,16 @@ import org.w3c.dom.Node
 
 const val DEBUG = false
 
-private fun rebuild_urself(args: Array<String>) {
-    val opts = parse_args(args)
-    val nob = Nob(opts)
-    val nob_class_file = File(opts.main_class(opts.nob_src.toFile()).split(".").fold(opts.target_dir) { acc, next -> acc.resolve(next) }.toString() + ".class")
-    // val nob_class_file = opts.main_class(opts.nob_src.toFile()).split(".").fold(opts.target_dir) { acc, next -> acc.resolve(next) }.resolve(".class").toFile()
-
-    if (opts.nob_src.toFile().exists() && nob_class_file.exists() && opts.nob_src.toFile().lastModified() > nob_class_file.lastModified()) {
-        // recompile self
-        val exit_code = nob.compile(opts.nob_src.toFile())
-
-        // Re-execute with the new class
-        ProcessBuilder(
-            "java",
-            "-cp", "out:${System.getProperty("java.class.path")}",
-            "nob.NobKt",
-            *args
-        ).inheritIO().start().waitFor()
-
-        // Exit this process to prevent running the outdated version
-        System.exit(exit_code)
-    }
-}
-
 fun main(args: Array<String>) {
-    rebuild_urself(args)
-
     val opts = parse_args(args)
+    var nob = Nob(opts)
+    nob.rebuild_urself(args)
+
     val libs = listOf(
         Lib.of("io.ktor:ktor-server-netty:3.2.2"),
         Lib.of("org.slf4j:slf4j-simple:2.0.17"),
     )
-    val nob = Nob(opts.copy(libs = solve_libs(opts, libs)))
+    nob = Nob(opts.copy(libs = solve_libs(opts, libs)))
     var exit_code =  nob.compile(opts.src_dir.toFile())
     if (exit_code == 0) exit_code = nob.run_target()
     System.exit(exit_code)
@@ -67,7 +45,13 @@ class Nob(private val opts: Opts) {
             else -> emptyList()
         }
         if (files.isEmpty()) error("no files to compile in $src")
-        return compile_with_daemon(files) 
+
+        val files_to_compile = files.filter { file ->
+            val compiled_file = get_compiled_file(file)
+            !compiled_file.exists() || Files.getLastModifiedTime(file.toPath()).toInstant() > Files.getLastModifiedTime(compiled_file.toPath()).toInstant()
+        }
+        if (files_to_compile.isEmpty()) return 0
+        return compile_with_daemon(files_to_compile) 
     }
 
     fun run_target(): Int {
@@ -151,6 +135,36 @@ class Nob(private val opts: Opts) {
             daemon.releaseCompileSession(session_id) 
         }
     }
+
+    fun rebuild_urself(args: Array<String>) {
+        val nob_class_file = opts.main_class(opts.nob_src.toFile())
+            .split(".")
+            .fold(opts.target_dir) { acc, next -> acc.resolve(next) }
+            .let { File(it.toFile().absolutePath + ".class").toPath() }
+
+        if(Files.getLastModifiedTime(opts.nob_src).toInstant() > Files.getLastModifiedTime(nob_class_file).toInstant()) {
+            val exit_code = compile(opts.nob_src.toFile())
+
+            // Re-execute with the new class
+            ProcessBuilder(
+                "java",
+                "-cp", "out:${System.getProperty("java.class.path")}",
+                "nob.NobKt",
+                *args
+            ).inheritIO().start().waitFor()
+
+            // Exit this process to prevent running the outdated version
+            System.exit(exit_code)
+        } 
+    }
+
+    private fun get_compiled_file(src: File): File {
+        val class_name = src.nameWithoutExtension.replaceFirstChar { it.uppercase() } + "Kt"
+        val pkg = src.useLines { lines -> lines.firstOrNull { it.trim().startsWith("package ") }?.removePrefix("package ")?.trim() }
+        val package_path = pkg?.replace('.', File.separatorChar) ?: ""
+        return opts.target_dir.resolve(package_path).resolve("$class_name.class").toFile()
+    }
+
 }
 
 private fun parse_args(args: Array<String>): Opts {
@@ -212,13 +226,9 @@ data class Opts(
         return "$kotlin_libs_paths:$target_dir_path"
     }
 
-    fun name(file: File): String {
-        return file.toPath().fileName.toString().removeSuffix(".kt").lowercase()
-    }
-
     fun main_class(src: File): String { 
-        val pkg = src.useLines { lines -> lines.firstOrNull { it.trim().startsWith("package ") }?.removePrefix("package ")?.trim() }?.replace('.', '/')
-        val main = name(src).replaceFirstChar{ it.uppercase() } + "Kt"
+        val pkg = src.useLines { lines -> lines.firstOrNull { it.trim().startsWith("package ") }?.removePrefix("package ")?.trim() }
+        val main = src.toPath().fileName.toString().removeSuffix(".kt").lowercase().replaceFirstChar{ it.uppercase() } + "Kt"
         return when (pkg) {
             null -> "$main"
             else -> "$pkg.$main"
