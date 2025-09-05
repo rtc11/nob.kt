@@ -36,14 +36,17 @@ fun main(args: Array<String>) {
 Update `Opts` to change main source file or other options:
 ```kotlin
 data class Opts(
-    val src_file: String = "main.kt",
-    val nob_src_file: String = "nob.kt",
-    val kotlin_lib: Path, 
+    val cwd: String = System.getProperty("user.dir"),
+    val src_dir: Path = Paths.get(cwd, "src").also { it.toFile().mkdirs() },
+    val target_dir: Path = Paths.get(cwd, "out").also { it.toFile().mkdirs() },
+    val kotlin_dir: Path = Paths.get(System.getProperty("KOTLIN_HOME"), "libexec/lib"),
+    val nob_src: Path = Paths.get(cwd, "nob.kt"),
+
     val libs: List<Lib> = emptyList(),
-    val out_dir: String = "out",
-    val jvm_target: Int = 21,
-    val kotlin_target: String = "2.2.0",
-    val backend_threads: Int = 0, // run codegen with N thread per processor (Default 1)
+    val jvm_version: Int = 21,
+    val kotlin_version: String = "2.2.0",
+
+    val backend_threads: Int = 0, // used in codegen where 1 = default, 0 = available cores
     val verbose: Boolean = false,
     val debug: Boolean = false,
     val error: Boolean = true,
@@ -51,3 +54,11 @@ data class Opts(
     var debugger: Boolean = false,
 )
 ```
+
+Run debugger:
+>./nob -debugger
+
+Attach debugger:
+> jdb -attach 5005
+
+See example project in `example/` 

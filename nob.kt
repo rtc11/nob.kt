@@ -29,115 +29,78 @@ fun main(args: Array<String>) {
         Lib.of("org.slf4j:slf4j-simple:2.0.17"),
     )
     val nob = Nob(opts.copy(libs = solve_libs(opts, libs)))
-    nob.compile_self()
-    var exit_code =  nob.compile(opts.src_file)
+    nob.compile(opts.nob_src.toFile())
+    var exit_code =  nob.compile(opts.src_dir.toFile())
     if (exit_code == 0) exit_code = nob.run_target()
     System.exit(exit_code)
 }
 
 class Nob(private val opts: Opts) {
-    fun compile_self() {
-        try {
-            require(compile(opts.nob_src_file, backup = true) == 0) { "Failed to compile nob." }
-            val nob_class_name = opts.name(opts.nob_src_file).replaceFirstChar { it.uppercase() } + "Kt.class"
-            val nob_class_path = opts.target_dir.resolve("nob").resolve(nob_class_name)
-            require(Files.exists(nob_class_path)) { "$nob_class_path not found after compilation!"}
-        } catch(e: Exception) {
-            e.printStackTrace()
-            restore()
+    fun compile(src: File): Int {
+        val files = when {
+            src.isFile() -> listOf(src)
+            src.isDirectory() -> src.listFiles().filter { it.toString().endsWith(".kt") }
+            else -> emptyList()
         }
-    }
-
-    fun compile(src_file: String, backup: Boolean = false): Int {
-        val src = opts.src(src_file)
-        val main_class = opts.main_class(src_file)
-        val src_modified = Files.getLastModifiedTime(src).toInstant() 
-        val main_class_modified = if (Files.exists(main_class)) Files.getLastModifiedTime(main_class).toInstant() else Instant.EPOCH
-        if (src_modified > main_class_modified) {
-            if (backup) backup()
-            return compile_with_daemon(src_file) 
-        } 
-        return 0
+        if (files.isEmpty()) error("no files to compile in $src")
+        return compile_with_daemon(files) 
     }
 
     fun run_target(): Int {
-        debug("Running ${opts.src_file}")
-        val main_class = opts.name(opts.src_file).replaceFirstChar { it.uppercase() } + "Kt"
+        debug("Running ${opts.main_src}")
         return exec(
             buildList {
                 add("java")
                 if (opts.debugger) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
                 add("-cp")
-                add(opts.runtime_classpath)
-                add(main_class)
+                add(opts.runtime_classpath())
+                add(opts.main_class(opts.main_src.toFile()))
             },
             opts
         )
     }
 
-    fun release(): Int {
-        val opts = opts.copy(debug = false, error = true)
-        val name = opts.name(opts.src_file)
-        val cmd = listOf("jar", "cfe", "${name}.jar", "${name}Kt", "-C", "${opts.target_dir}", ".")
-        if (opts.verbose) info("$cmd")
-        info("package ${name}.jar")
-        return exec(cmd, opts)
-    }
+    // fun release(): Int {
+    //     val opts = opts.copy(debug = false, error = true)
+    //     val name = opts.name(opts.src_file)
+    //     val cmd = listOf("jar", "cfe", "${name}.jar", "${name}Kt", "-C", "${opts.target_dir}", ".")
+    //     if (opts.verbose) info("$cmd")
+    //     info("package ${name}.jar")
+    //     return exec(cmd, opts)
+    // }
 
-    fun backup() {
-        val main_class = opts.main_class(opts.nob_src_file).toFile()
-        if (main_class.exists()) {
-            debug("backup $main_class")
-            val backup = File(main_class.parentFile, main_class.name + ".bak")
-            main_class.copyTo(backup, overwrite = true)
-        }
-    }
+    fun compile_with_daemon(files: List<File>): Int {
+        val compiler_id = CompilerId.makeCompilerId(Files.list(opts.kotlin_dir).filter { it.toString().endsWith(".jar") }.map { it.toFile() }.toList())
+        val client_alive_file = opts.target_dir.resolve(".alive").toFile().apply { if (!exists()) createNewFile() }
 
-    fun restore() {
-        val main_class = opts.main_class(opts.nob_src_file).toFile()
-        val backup = File(main_class.parentFile, opts.name(opts.nob_src_file) + ".bak")
-        if (backup.exists()) {
-            debug("restoring $main_class")
-            backup.copyTo(main_class, overwrite = true) 
-        }
-    }
-
-    fun compile_with_daemon(src_file: String): Int {
-        val compiler_id = CompilerId.makeCompilerId(
-            Files.list(opts.kotlin_lib)
-                .filter { it.toString().endsWith(".jar") } 
-                .map { it.toFile() }
-                .toList()
-        )
-        val daemon_opts = DaemonOptions(verbose = opts.verbose)
-        val daemon_jvm_opts = DaemonJVMOptions()
-        val client_alive_file = File("${opts.out_dir}/.alive").apply { if (!exists()) createNewFile() }
-
-        val classpath = when (src_file){
-            opts.nob_src_file -> opts.nob_compile_classpath
-            else -> opts.compile_classpath
+        val classpath = when (files.any { it.toPath() == opts.nob_src }){
+            true -> opts.nob_compile_classpath()
+            else -> opts.compile_classpath()
         }
 
-        val args = mutableListOf(
-            File(src_file).absolutePath,
-            "-d", opts.target_dir.toString(),
-            "-jvm-target", opts.jvm_target.toString(),
-            "-Xbackend-threads=${opts.backend_threads}",
-            "-cp", classpath,
-        )
-        debug("kotlinc args: $args")
-        if (opts.verbose) args += "-verbose"
-        if (opts.debug) args += "-Xdebug"
-        if (opts.extra) args += "-Wextra"
-        if (opts.error) args += "-Werror"
+        val args = buildList {
+            add("-d")
+            add(opts.target_dir.toString())
+            add("-jvm-target")
+            add(opts.jvm_version.toString())
+            add("-Xbackend-threads=${opts.backend_threads}")
+            add("-cp")
+            add(classpath)
+            if (opts.verbose) add("-verbose")
+            if (opts.debug) add("-Xdebug")
+            if (opts.extra) add("-Wextra")
+            if (opts.error) add("-Werror")
+            files.forEach { add(it.absolutePath) }
+        }
+        debug("kotlinc ${args.joinToString(" ")}")
 
         val daemon_reports = arrayListOf<DaemonReportMessage>()
 
         val daemon = KotlinCompilerClient.connectToCompileService(
             compilerId = compiler_id,
             clientAliveFlagFile = client_alive_file,
-            daemonJVMOptions = daemon_jvm_opts,
-            daemonOptions = daemon_opts,
+            daemonJVMOptions = DaemonJVMOptions(),
+            daemonOptions = DaemonOptions(verbose = opts.verbose),
             reportingTargets = DaemonReportingTargets(out = if (opts.verbose) System.out else null, messages = daemon_reports),
             autostart = true,
         ) ?: error("unable to connect to compiler daemon: " + 
@@ -158,7 +121,7 @@ class Nob(private val opts: Opts) {
                 reportSeverity = ReportSeverity.INFO,
             )
             val end_time = System.nanoTime()
-            info("Compiled $src_file in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
+            info("Compiled ${files.map{it.name}} in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
             return exit_code
         } finally {
             daemon.releaseCompileSession(session_id) 
@@ -168,7 +131,7 @@ class Nob(private val opts: Opts) {
 
 private fun parse_args(args: Array<String>): Opts {
     var pos = 0
-    var opts = Opts(kotlin_lib = args.get(pos++).let(Paths::get))
+    var opts = Opts(kotlin_dir = args.get(pos++).let(Paths::get))
     while(true) {
         when (val arg = args.getOrNull(pos++)) {
             "-debugger" -> opts.debugger = true
@@ -179,13 +142,16 @@ private fun parse_args(args: Array<String>): Opts {
 }
 
 data class Opts(
-    val src_file: String = "main.kt",
-    val nob_src_file: String = "nob.kt",
-    val kotlin_lib: Path, 
+    val cwd: String = System.getProperty("user.dir"),
+    val src_dir: Path = Paths.get(cwd, "example").also { it.toFile().mkdirs() },
+    val target_dir: Path = Paths.get(cwd, "out").also { it.toFile().mkdirs() },
+    val kotlin_dir: Path = Paths.get(System.getProperty("KOTLIN_HOME"), "libexec/lib"),
+    val nob_src: Path = Paths.get(cwd, "nob.kt"),
+
     val libs: List<Lib> = emptyList(),
-    val out_dir: String = "out",
-    val jvm_target: Int = 21,
-    val kotlin_target: String = "2.2.0",
+    val jvm_version: Int = 21,
+    val kotlin_version: String = "2.2.0",
+
     val backend_threads: Int = 0, // run codegen with N thread per processor (Default 1)
     val verbose: Boolean = false,
     val debug: Boolean = false,
@@ -193,36 +159,45 @@ data class Opts(
     val extra: Boolean = false,
     var debugger: Boolean = false,
 ) {
-    val cwd: String = System.getProperty("user.dir")
-    val target_dir: Path = Paths.get(cwd, out_dir).also { it.toFile().mkdirs() }
+    val main_src: Path = Files.walk(src_dir)
+        .filter { it.toFile().isFile() }
+        .filter { it.toFile().readText().contains("fun main(") }
+        .toList()
+        .firstOrNull() ?: error("no main() found")
 
-    val runtime_classpath: String = (
-        libs.filter { it.scope == "runtime" || it.scope == "compile" }.map { it.jar_path } + 
-        listOf(target_dir)
-    ).map { it.toAbsolutePath().normalize().toString() }.joinToString(":")
+    fun runtime_classpath(): String {
+        val libs_paths = libs.filter { it.scope == "compile" || it.scope == "runtime" }
+            .joinToString(File.pathSeparator) { it.jar_path.toAbsolutePath().normalize().toString() }
+        val target_dir_path = target_dir.toAbsolutePath().normalize().toString()
+        return "$libs_paths:$target_dir_path"
+    }
 
-    val compile_classpath: String = (
-        libs.filter { it.scope == "compile" }.map { it.jar_path } + 
-        listOf("kotlin-stdlib.jar", "kotlin-compiler.jar", "kotlin-daemon.jar", "kotlin-daemon-client.jar").map { kotlin_lib.resolve(it)} + 
-        listOf(target_dir)
-    ).map { it.toAbsolutePath().normalize().toString() }.toSet().joinToString(File.pathSeparator)
+    fun compile_classpath(): String {
+        val kotlin_libs_paths = listOf("kotlin-stdlib.jar", "kotlin-compiler.jar", "kotlin-daemon.jar", "kotlin-daemon-client.jar")
+            .joinToString(File.pathSeparator) { kotlin_dir.resolve(it).toAbsolutePath().normalize().toString() }
+        val libs_paths = libs.filter { it.scope == "compile" }
+            .joinToString(File.pathSeparator) { it.jar_path.toAbsolutePath().normalize().toString() }
+        val target_dir_path = target_dir.toAbsolutePath().normalize().toString()
+        return "$kotlin_libs_paths:$libs_paths:$target_dir_path"
+    }
 
-    val nob_compile_classpath: String = (
-        libs.filter { it.scope == "lol" }.map { it.jar_path } + 
-        listOf("kotlin-stdlib.jar", "kotlin-compiler.jar", "kotlin-daemon.jar", "kotlin-daemon-client.jar").map { kotlin_lib.resolve(it)} + 
-        listOf(target_dir)
-    ).map { it.toAbsolutePath().normalize().toString() }.toSet().joinToString(File.pathSeparator)
+    fun nob_compile_classpath(): String {
+        val kotlin_libs_paths = listOf("kotlin-stdlib.jar", "kotlin-compiler.jar", "kotlin-daemon.jar", "kotlin-daemon-client.jar")
+            .joinToString(File.pathSeparator) { kotlin_dir.resolve(it).toAbsolutePath().normalize().toString() }
+        val target_dir_path = target_dir.toAbsolutePath().normalize().toString()
+        return "$kotlin_libs_paths:$target_dir_path"
+    }
 
-    fun name(src_file: String) = src_file.removeSuffix(".kt").lowercase()
-    fun src(src_file: String): Path = Paths.get(cwd, src_file).normalize()
-    fun main_path(src_file: String): Path = Paths.get(cwd, src_file)
-    fun main_class(src_file: String): Path { 
-        val src = src(src_file).toFile()
-        val pkg = src.useLines { lines -> lines.firstOrNull { it.trim().startsWith("package ") }?.removePrefix("package ")?.trim() }
-        val class_name = name(src_file).replaceFirstChar{ it.uppercase() } + "Kt.class"
+    fun name(file: File): String {
+        return file.toPath().fileName.toString().removeSuffix(".kt").lowercase()
+    }
+
+    fun main_class(src: File): String { 
+        val pkg = src.useLines { lines -> lines.firstOrNull { it.trim().startsWith("package ") }?.removePrefix("package ")?.trim() }?.replace('.', '/')
+        val main = name(src).replaceFirstChar{ it.uppercase() } + "Kt"
         return when (pkg) {
-            null -> target_dir.resolve(class_name)
-            else -> target_dir.resolve(pkg.replace('.', '/')).resolve(class_name)
+            null -> "$main"
+            else -> "$pkg.$main"
         }
     }
 }
@@ -356,11 +331,11 @@ private fun List<Lib>.resolve_kotlin_libs(opts: Opts): List<Lib> {
         .map {
             when (it.group_id) {
                 "org.jetbrains.kotlin" -> {
-                    val local = opts.kotlin_lib.resolve("${it.artifact_id}.jar")
+                    val local = opts.kotlin_dir.resolve("${it.artifact_id}.jar")
                     if (local.toFile().exists()) {
-                        it.copy(version = opts.kotlin_target, jar_path = local)
+                        it.copy(version = opts.kotlin_version, jar_path = local)
                     } else {
-                        err("dependent on ${it.scope} lib $it but it was not found in ${opts.kotlin_lib} with version ${opts.kotlin_target}. Fallback to version ${it.version}")
+                        err("dependent on ${it.scope} lib $it but it was not found in ${opts.kotlin_dir} with version ${opts.kotlin_version}. Fallback to version ${it.version}")
                         it // keep original if missing
                     }
                 }
