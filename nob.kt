@@ -41,7 +41,7 @@ class Nob(private val opts: Opts) {
     fun compile(src: File): Int {
         val files = when {
             src.isFile() -> listOf(src)
-            src.isDirectory() -> src.listFiles().filter { it.toString().endsWith(".kt") }
+            src.isDirectory() -> src.walkTopDown().filter { it.isFile && it.toString().endsWith(".kt") }.toList()
             else -> emptyList()
         }
         if (files.isEmpty()) error("no files to compile in $src")
@@ -51,7 +51,8 @@ class Nob(private val opts: Opts) {
             !compiled_file.exists() || Files.getLastModifiedTime(file.toPath()).toInstant() > Files.getLastModifiedTime(compiled_file.toPath()).toInstant()
         }
         if (files_to_compile.isEmpty()) return 0
-        return compile_with_daemon(files_to_compile) 
+        return compile_with_daemon(files) // TODO: also include every dependent local file (import <packagename>)
+        // return compile_with_daemon(files_to_compile)
     }
 
     fun run_target(): Int {
@@ -124,7 +125,7 @@ class Nob(private val opts: Opts) {
                 sessionId = session_id,
                 targetPlatform = CompileService.TargetPlatform.JVM,
                 args = args.toTypedArray(),
-                messageCollector = PrintingMessageCollector(System.err, MessageRenderer.WITHOUT_PATHS, true),
+                messageCollector = PrintingMessageCollector(System.err, MessageRenderer.PLAIN_FULL_PATHS, true),
                 compilerMode = CompilerMode.NON_INCREMENTAL_COMPILER,
                 reportSeverity = ReportSeverity.INFO,
             )
