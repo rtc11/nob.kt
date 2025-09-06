@@ -33,7 +33,16 @@ fun main(args: Array<String>) {
     )
     nob = Nob(opts.copy(libs = solve_libs(opts, libs)))
     var exit_code =  nob.compile(opts.src_dir.toFile())
-    if (exit_code == 0) exit_code = nob.run_target()
+
+    exit_code = when {
+        opts.test -> {
+            nob.compile(opts.test_dir.toFile())
+            nob.run_test(args)
+        }
+        opts.run -> nob.run_target()
+        else -> 0
+    }
+
     System.exit(exit_code)
 }
 
@@ -69,6 +78,24 @@ class Nob(private val opts: Opts) {
         )
     }
 
+    fun run_test(args: Array<String>): Int {
+        debug("Testing ${opts.main_src}")
+        return exec(
+            buildList {
+                add("java")
+                add("-Dfile.encoding=UTF-8")
+                add("-Dsun.stdout.encoding=UTF-8")
+                add("-Dsun.stderr.encoding=UTF-8")
+                if (opts.debugger) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
+                add("-cp")
+                add(opts.test_classpath())
+                add(opts.main_class(opts.main_src.toFile()))
+                args.drop(2).forEach { add(it) }
+            },
+            opts
+        )
+    }
+
     // fun release(): Int {
     //     val opts = opts.copy(debug = false, error = true)
     //     val name = opts.name(opts.src_file)
@@ -93,6 +120,10 @@ class Nob(private val opts: Opts) {
             add("-jvm-target")
             add(opts.jvm_version.toString())
             add("-Xbackend-threads=${opts.backend_threads}")
+            // add("-Xno-optimize")
+            // add("-Xuse-fast-jar-file-system")
+            // add("-Xuse-k2")
+            // add("-Xenable-incremental-compilation")
             add("-cp")
             add(classpath)
             if (opts.verbose) add("-verbose")
@@ -182,7 +213,8 @@ private fun parse_args(args: Array<String>): Opts {
 
 data class Opts(
     val cwd: String = System.getProperty("user.dir"),
-    val src_dir: Path = Paths.get(cwd, "example").also { it.toFile().mkdirs() },
+    val src_dir: Path = Paths.get(cwd, "example"),
+    val test_dir: Path = Paths.get(cwd, "test"),
     val target_dir: Path = Paths.get(cwd, "out").also { it.toFile().mkdirs() },
     val kotlin_dir: Path = Paths.get(System.getProperty("KOTLIN_HOME"), "libexec", "lib"), // TODO: default not working
     val nob_src: Path = Paths.get(cwd, "nob.kt"),
@@ -197,6 +229,8 @@ data class Opts(
     val error: Boolean = true,
     val extra: Boolean = false,
     var debugger: Boolean = false,
+    var run: Boolean = false,
+    var test: Boolean = false,
 ) {
     val main_src: Path = Files.walk(src_dir)
         .filter { it.toFile().isFile() }
@@ -209,6 +243,16 @@ data class Opts(
             .joinToString(File.pathSeparator) { it.jar_path.toAbsolutePath().normalize().toString() }
         val target_dir_path = target_dir.toAbsolutePath().normalize().toString()
         return "$libs_paths:$target_dir_path"
+    }
+
+    fun test_classpath(): String {
+        val libs_paths = libs.filter { it.scope == "compile" || it.scope == "runtime" }
+            .joinToString(File.pathSeparator) { it.jar_path.toAbsolutePath().normalize().toString() }
+        val target_dir_path = target_dir.toAbsolutePath().normalize().toString()
+        val test_dir_path = test_dir.toAbsolutePath().normalize().toString()
+        val src_dir_path = src_dir.toAbsolutePath().normalize().toString()
+        val res_dir_path = Paths.get(cwd, ".res").toAbsolutePath().normalize().toString()
+        return "$libs_paths:$target_dir_path:$test_dir_path:$src_dir_path:$res_dir_path"
     }
 
     fun compile_classpath(): String {
