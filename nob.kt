@@ -64,20 +64,6 @@ class Nob(private val opts: Opts) {
         // return compile_with_daemon(files_to_compile)
     }
 
-    fun run_target(): Int {
-        debug("Running ${opts.main_src}")
-        return exec(
-            buildList {
-                add("java")
-                if (opts.debugger) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
-                add("-cp")
-                add(opts.runtime_classpath())
-                add(opts.main_class(opts.main_src.toFile()))
-            },
-            opts
-        )
-    }
-
     fun run_test(args: Array<String>): Int {
         debug("Testing ${opts.main_src}")
         return exec(
@@ -86,11 +72,28 @@ class Nob(private val opts: Opts) {
                 add("-Dfile.encoding=UTF-8")
                 add("-Dsun.stdout.encoding=UTF-8")
                 add("-Dsun.stderr.encoding=UTF-8")
-                if (opts.debugger) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
+                if (opts.debug) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
                 add("-cp")
                 add(opts.test_classpath())
                 add(opts.main_class(opts.main_src.toFile()))
                 args.drop(2).forEach { add(it) }
+            },
+            opts
+        )
+    }
+
+    fun run_target(): Int {
+        debug("Running ${opts.main_src}")
+        return exec(
+            buildList {
+                add("java")
+                add("-Dfile.encoding=UTF-8")
+                add("-Dsun.stdout.encoding=UTF-8")
+                add("-Dsun.stderr.encoding=UTF-8")
+                if (opts.debug) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
+                add("-cp")
+                add(opts.runtime_classpath())
+                add(opts.main_class(opts.main_src.toFile()))
             },
             opts
         )
@@ -120,10 +123,9 @@ class Nob(private val opts: Opts) {
             add("-jvm-target")
             add(opts.jvm_version.toString())
             add("-Xbackend-threads=${opts.backend_threads}")
-            // add("-Xno-optimize")
-            // add("-Xuse-fast-jar-file-system")
-            // add("-Xuse-k2")
-            // add("-Xenable-incremental-compilation")
+            if (!opts.debug) add("-Xno-optimize")
+            add("-Xuse-fast-jar-file-system")
+            add("-Xenable-incremental-compilation")
             add("-cp")
             add(classpath)
             if (opts.verbose) add("-verbose")
@@ -204,7 +206,8 @@ private fun parse_args(args: Array<String>): Opts {
     var opts = Opts(kotlin_dir = args.get(pos++).let(Paths::get))
     while(true) {
         when (val arg = args.getOrNull(pos++)) {
-            "-debugger" -> opts.debugger = true
+            "debug" -> {opts.debug = true; opts.run = true }
+            "run" -> opts.run = true
             null -> break
         }
     }
@@ -225,10 +228,9 @@ data class Opts(
 
     val backend_threads: Int = 0, // run codegen with N thread per processor (Default 1)
     val verbose: Boolean = false,
-    val debug: Boolean = false,
+    var debug: Boolean = false,
     val error: Boolean = true,
     val extra: Boolean = false,
-    var debugger: Boolean = false,
     var run: Boolean = false,
     var test: Boolean = false,
 ) {
