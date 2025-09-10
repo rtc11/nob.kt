@@ -1,24 +1,11 @@
 package nob
 
 import java.io.*
-import java.lang.ProcessBuilder
-import java.net.URI
-import java.nio.file.Files
-import java.nio.file.Path
-import java.nio.file.Paths
-import java.time.Instant
+import java.nio.file.*
 import java.util.*
-import java.util.concurrent.TimeUnit
-import java.util.function.*
-import javax.xml.parsers.DocumentBuilderFactory
-import org.jetbrains.kotlin.cli.common.messages.MessageRenderer
-import org.jetbrains.kotlin.cli.common.messages.PrintingMessageCollector
 import org.jetbrains.kotlin.daemon.client.*
 import org.jetbrains.kotlin.daemon.common.*
-import org.w3c.dom.Document
-import org.w3c.dom.Element
-import org.w3c.dom.NodeList
-import org.w3c.dom.Node
+import org.w3c.dom.*
 
 const val DEBUG = false
 
@@ -67,7 +54,7 @@ class Nob(private val opts: Opts) {
         }
         // TODO: only compile the changed files with their dependents
         if (!files_to_compile.isEmpty()) compile_with_daemon(files) 
-        info("Compiled ${files.map{it.name}} in " + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start_time) + " ms")
+        info("Compiled ${files.map{it.name}} in " + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start_time) + " ms")
     }
 
     fun run_test(args: Array<String>) {
@@ -114,11 +101,11 @@ class Nob(private val opts: Opts) {
 
     fun exec(cmd: List<String>) {
         if (opts.verbose) info(cmd.joinToString(" "))
-        val builder = ProcessBuilder(cmd)
-        builder.inheritIO()
-        builder.directory(File(opts.cwd))
-        val process = builder.start()
-        exit_code = process.waitFor()
+        exit_code = java.lang.ProcessBuilder(cmd)
+            .inheritIO()
+            .directory(File(opts.cwd))
+            .start()
+            .waitFor()
     }
 
     private fun compile_with_daemon(files: List<File>) {
@@ -165,18 +152,15 @@ class Nob(private val opts: Opts) {
 
         val session_id = daemon.leaseCompileSession(client_alive_file.absolutePath).get()
         try {
-            // val start_time = System.nanoTime()
             exit_code = KotlinCompilerClient.compile(
                 compilerService = daemon,
                 sessionId = session_id,
                 targetPlatform = CompileService.TargetPlatform.JVM,
                 args = args.toTypedArray(),
-                messageCollector = PrintingMessageCollector(System.err, MessageRenderer.PLAIN_FULL_PATHS, true),
+                messageCollector = org.jetbrains.kotlin.cli.common.messages.PrintingMessageCollector(System.err, org.jetbrains.kotlin.cli.common.messages.MessageRenderer.PLAIN_FULL_PATHS, true),
                 compilerMode = CompilerMode.NON_INCREMENTAL_COMPILER,
                 reportSeverity = ReportSeverity.INFO,
             )
-            // val end_time = System.nanoTime()
-            // info("Compiled ${files.map{it.name}} in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
         } finally {
             daemon.releaseCompileSession(session_id) 
         }
@@ -191,7 +175,7 @@ class Nob(private val opts: Opts) {
         if(Files.getLastModifiedTime(opts.nob_src).toInstant() > Files.getLastModifiedTime(nob_class_file).toInstant()) {
             compile(opts.nob_src.toFile())
 
-            ProcessBuilder(
+            java.lang.ProcessBuilder(
                 "java",
                 "-cp", "out:${System.getProperty("java.class.path")}",
                 "nob.NobKt",
@@ -332,7 +316,7 @@ data class Lib(
     }
 }
 
-private fun download_file(url: URI, file: File) {
+private fun download_file(url: java.net.URI, file: File) {
     if (file.exists()) {
         debug("download $url ${color("[CACHE]", Color.yellow)}")
         return
@@ -351,7 +335,7 @@ private fun download_file(url: URI, file: File) {
 
 private fun download_jar(lib: Lib) {
     if (lib.type != "jar") return
-    download_file(URI(lib.jar_url),lib.jar_file)
+    download_file(java.net.URI(lib.jar_url),lib.jar_file)
 }
 
 data class ResolvedLib(val lib: Lib, val resolved_from: String)
@@ -399,7 +383,7 @@ private fun solve_libs(opts: Opts, libs: List<Lib>): List<Lib> {
 
         save_cache(cache_file, resolved)
         val end_time = System.nanoTime()
-        info("Resolved ${resolved.size} libs in " + TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
+        info("Resolved ${resolved.size} libs in " + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(end_time - start_time) + " ms")
     }
 
     return resolved.map { it.lib }.resolve_kotlin_libs(opts)
@@ -476,7 +460,7 @@ class GradleResolver {
                     val file_url = file_info["url"] as? String
                     if (file_name != null && file_url != null) {
                         download_file(
-                            url = URI(lib.module_url).resolve(file_url), 
+                            url = java.net.URI(lib.module_url).resolve(file_url), 
                             file = File("${jar_cache_dir}/${component_group}/${file_name}").also { it.parentFile.mkdirs() },
                         )
                     }
@@ -523,7 +507,7 @@ class GradleResolver {
                 lib.module_file.readText()
                     .also { debug("download ${lib.module_url} ${color("[CACHE]", Color.yellow)}") }
             } else {
-                URI(lib.module_url).toURL().openStream().bufferedReader().use { it.readText() }
+                java.net.URI(lib.module_url).toURL().openStream().bufferedReader().use { it.readText() }
                     .also { lib.module_file.writeText(it) }
                     .also { info("download ${lib.module_url} ${color("[OK]", Color.green)}") }
             }
@@ -730,7 +714,8 @@ class MavenResolver {
         .replace(Regex("&(?!amp;)(?!lt;)(?!gt;)(?!quot;)(?!apos;).+;"), "") // remove malformed tags
 
     private fun download_pom(lib: Lib): Document? {
-        fun document(text: String) = DocumentBuilderFactory.newInstance()
+        fun document(text: String) = javax.xml.parsers.DocumentBuilderFactory
+            .newInstance()
             .apply { 
                 setFeature("http://xml.org/sax/features/external-general-entities", false)
                 setFeature("http://xml.org/sax/features/external-parameter-entities", false)
@@ -747,7 +732,7 @@ class MavenResolver {
                 return document(lib.pom_file.readText().sanitize())
                     .also { debug("download ${lib.pom_url} ${color("[CACHE]", Color.yellow)}") }
             }
-            val text = URI(lib.pom_url).toURL().openStream().bufferedReader().use { it.readText() }.sanitize()
+            val text = java.net.URI(lib.pom_url).toURL().openStream().bufferedReader().use { it.readText() }.sanitize()
             lib.pom_file.writeText(text)
             return document(text)
                 .also { info("download ${lib.pom_url} ${color("[OK]", Color.green)}") }
