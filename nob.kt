@@ -3,6 +3,8 @@ package nob
 import java.io.*
 import java.nio.file.*
 import java.util.*
+import java.util.jar.*
+import kotlin.streams.asSequence
 import org.jetbrains.kotlin.daemon.client.*
 import org.jetbrains.kotlin.daemon.common.*
 import org.w3c.dom.*
@@ -25,7 +27,7 @@ fun main(args: Array<String>) {
             nob.run_test(args)
         }
         opts.run -> nob.run_target()
-        else -> nob.compile(opts.src_dir.toFile())
+        else -> nob.compile(opts.src_dirs.first().toFile())
     }
 
     nob.exit()
@@ -46,15 +48,17 @@ class Nob(private val opts: Opts) {
             src.isDirectory() -> src.walkTopDown().filter { it.isFile && it.toString().endsWith(".kt") }.toList()
             else -> emptyList()
         }
-        if (files.isEmpty()) error("no files to compile in $src")
 
-        val files_to_compile = files.filter { file ->
+        val should_compile = files.any { file ->
             val compiled_file = get_compiled_file(file)
-            !compiled_file.exists() || Files.getLastModifiedTime(file.toPath()).toInstant() > Files.getLastModifiedTime(compiled_file.toPath()).toInstant()
+            !compiled_file.exists() || Files.getLastModifiedTime(file.toPath()).toMillis() > Files.getLastModifiedTime(compiled_file.toPath()).toMillis()
         }
-        // TODO: only compile the changed files with their dependents
-        if (!files_to_compile.isEmpty()) compile_with_daemon(files) 
-        info("Compiled ${files.map{it.name}} in " + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start_time) + " ms")
+
+        if (should_compile) {
+            compile_with_daemon(src.toPath() == opts.nob_src)
+        }
+
+        info("Compiled ${Paths.get(opts.cwd).relativize(src.toPath())} in " + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start_time) + " ms")
     }
 
     fun run_test(args: Array<String>) {
@@ -90,14 +94,66 @@ class Nob(private val opts: Opts) {
         )
     }
 
-    // fun release(): Int {
-    //     val opts = opts.copy(debug = false, error = true)
-    //     val name = opts.name(opts.src_file)
-    //     val cmd = listOf("jar", "cfe", "${name}.jar", "${name}Kt", "-C", "${opts.target_dir}", ".")
-    //     if (opts.verbose) info("$cmd")
-    //     info("package ${name}.jar")
-    //     return exec(cmd, opts)
-    // }
+    fun release(jar_name: String) {
+        val start_time = System.nanoTime()
+        val lib_jar_file = opts.target_dir.resolve("$jar_name.jar").toFile()
+        exec("jar", "cf", lib_jar_file.absolutePath, "-C", opts.target_dir.toAbsolutePath().toString(), ".")
+        if (exit_code != 0) err("Failed to release $jar_name")
+        info("Released $jar_name in " + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start_time) + " ms")
+    }
+
+    fun release(jar_name: String, main_class_fq: String) {
+        val startTime = System.nanoTime()
+        val fatJarFile = opts.target_dir.resolve("$jar_name.jar").toFile()
+
+        val addedEntries = mutableSetOf<String>()
+
+        JarOutputStream(FileOutputStream(fatJarFile)).use { jar ->
+            // Add manifest
+            val manifest = java.util.jar.Manifest().apply {
+                mainAttributes.put(java.util.jar.Attributes.Name.MANIFEST_VERSION, "1.0")
+                mainAttributes.put(java.util.jar.Attributes.Name.MAIN_CLASS, main_class_fq)
+            }
+            JarOutputStream(FileOutputStream(fatJarFile), manifest).use { jarStream ->
+
+                // Helper for adding file
+                fun addFile(file: File, baseDir: File) {
+                    val entryName = baseDir.toPath().relativize(file.toPath()).toString().replace("\\", "/")
+                    if (addedEntries.add(entryName)) { // only add if not added yet
+                        jarStream.putNextEntry(JarEntry(entryName))
+                        file.inputStream().use { it.copyTo(jarStream) }
+                        jarStream.closeEntry()
+                    }
+                }
+
+                // Add compiled classes
+                opts.target_dir.toFile().walkTopDown()
+                    .filter { it.isFile && it.extension == "class" }
+                    .forEach { addFile(it, opts.target_dir.toFile()) }
+
+                // Add dependency JARs
+                opts.libs.forEach { lib ->
+                    if (lib.jar_file.exists()) {
+                        java.util.zip.ZipFile(lib.jar_file).use { zip ->
+                            zip.entries().asSequence().forEach { entry ->
+                                val name = entry.name
+                                if (name.startsWith("META-INF/")) return@forEach
+                                if (addedEntries.add(name)) {
+                                    jarStream.putNextEntry(JarEntry(name))
+                                    zip.getInputStream(entry).use { it.copyTo(jarStream) }
+                                    jarStream.closeEntry()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        info("Released $jar_name in " + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTime) + " ms → ${fatJarFile.absolutePath}")
+    }
+
+    fun exec(vararg cmd: String)  = exec(cmd.toList())
 
     fun exec(cmd: List<String>) {
         if (opts.verbose) info(cmd.joinToString(" "))
@@ -108,11 +164,11 @@ class Nob(private val opts: Opts) {
             .waitFor()
     }
 
-    private fun compile_with_daemon(files: List<File>) {
+    private fun compile_with_daemon(is_urself: Boolean = false) {
         val compiler_id = CompilerId.makeCompilerId(Files.list(opts.kotlin_dir).filter { it.toString().endsWith(".jar") }.map { it.toFile() }.toList())
         val client_alive_file = opts.target_dir.resolve(".alive").toFile().apply { if (!exists()) createNewFile() }
 
-        val classpath = when (files.any { it.toPath() == opts.nob_src }){
+        val classpath = when (is_urself){
             true -> opts.nob_compile_classpath()
             else -> opts.compile_classpath()
         }
@@ -132,7 +188,8 @@ class Nob(private val opts: Opts) {
             if (opts.debug) add("-Xdebug")
             if (opts.extra) add("-Wextra")
             if (opts.error) add("-Werror")
-            files.forEach { add(it.absolutePath) }
+            if (is_urself) { add(opts.nob_src.toFile().absolutePath) }
+            opts.src_dirs.forEach { add(it.toString()) }
         }
         if (opts.verbose) info("kotlinc ${args.joinToString(" ")}")
 
@@ -209,7 +266,7 @@ private fun parse_args(args: Array<String>): Opts {
 
 data class Opts(
     var cwd: String = System.getProperty("user.dir"),
-    var src_dir: Path = Paths.get(cwd, "example"),
+    var src_dirs: List<Path> = listOf(Paths.get(cwd, "example")),
     var test_dir: Path = Paths.get(cwd, "test"),
     var target_dir: Path = Paths.get(cwd, "out").also { it.toFile().mkdirs() },
     var kotlin_dir: Path = Paths.get(System.getProperty("KOTLIN_HOME"), "libexec", "lib"), // TODO: default not working
@@ -226,11 +283,12 @@ data class Opts(
     var extra: Boolean = false,
     var run: Boolean = false,
     var test: Boolean = false,
+    var release: Boolean = false,
 ) {
-    val main_src: Path = Files.walk(src_dir)
+    val main_src: Path get() = src_dirs.asSequence()
+        .flatMap { Files.walk(it).asSequence() }
         .filter { it.toFile().isFile() }
         .filter { it.toFile().readText().contains("fun main(") }
-        .toList()
         .firstOrNull() ?: error("no main() found")
 
     fun runtime_classpath(): String {
@@ -245,9 +303,9 @@ data class Opts(
             .joinToString(File.pathSeparator) { it.jar_path.toAbsolutePath().normalize().toString() }
         val target_dir_path = target_dir.toAbsolutePath().normalize().toString()
         val test_dir_path = test_dir.toAbsolutePath().normalize().toString()
-        val src_dir_path = src_dir.toAbsolutePath().normalize().toString()
+        val src_dirs_path = src_dirs.joinToString(File.pathSeparator) { it.toAbsolutePath().normalize().toString() }
         val res_dir_path = Paths.get(cwd, ".res").toAbsolutePath().normalize().toString()
-        return "$libs_paths:$target_dir_path:$test_dir_path:$src_dir_path:$res_dir_path"
+        return "$libs_paths:$target_dir_path:$test_dir_path:$src_dirs_path:$res_dir_path"
     }
 
     fun compile_classpath(): String {
@@ -563,8 +621,10 @@ class MavenResolver {
         return resolved
     }
 
-    private fun get_doc(lib: Lib): Document {
-        return pom_cache.getOrPut(lib) { download_pom(lib) ?: error("pom not found") }
+    private fun get_doc(lib: Lib): Document? {
+        val pom = pom_cache[lib] ?: download_pom(lib) 
+        if (pom != null) pom_cache[lib] = pom
+        return pom
     }
 
     private fun get_parent_lib(pom: Document): Lib? {
@@ -612,7 +672,12 @@ class MavenResolver {
         val value = props[prop_name]
         if (value != null) return value.takeIf { !it.matches(Regex("""\$\{(.+?)}""")) } ?: find_prop(value.substringAfter("\${").substringBefore("}"), pom)
         val parent_lib = get_parent_lib(pom)
-        return if (parent_lib != null) find_prop(prop_name, get_doc(parent_lib)) else null
+        if (parent_lib != null) {
+            get_doc(parent_lib)?.let { doc ->
+                return find_prop(prop_name, doc)
+            }
+        }
+        return null
     }
 
     private fun find_managed_version(key: LibKey, pom: Document): String? {
@@ -624,15 +689,19 @@ class MavenResolver {
         }
         val parent_lib = get_parent_lib(pom)
         if (parent_lib != null) {
-            val version = find_managed_version(key, get_doc(parent_lib))
-            if (version != null) return version
+            get_doc(parent_lib)?.let { doc ->
+                val version = find_managed_version(key, doc)
+                if (version != null) return version
+            }
         }
 
         val boms = get_boms(pom)
         for (bom_lib in boms) {
-            val bom_pom = get_doc(bom_lib)
-            val version = find_managed_version(key, bom_pom)
-            if (version != null) return version
+            get_doc(bom_lib)?.let { doc ->
+                find_managed_version(key, doc)?.let { version ->
+                    return version
+                }
+            }
         }
         return null
     }
@@ -662,13 +731,17 @@ class MavenResolver {
         if (managed_lib != null) return managed_lib.scope
         val parent_lib = get_parent_lib(pom)
         if (parent_lib != null) {
-            val scope = find_managed_scope(key, get_doc(parent_lib))
-            if (scope != "compile") return scope
+            get_doc(parent_lib)?.let { doc ->
+                val scope = find_managed_scope(key, doc)
+                if (scope != "compile") return scope
+            }
         } 
         val boms = get_boms(pom)
         for (bom_lib in boms) {
-            val scope = find_managed_scope(key, get_doc(bom_lib))
-            if (scope != "compile") return scope
+            get_doc(bom_lib)?.let { doc ->
+                val scope = find_managed_scope(key, doc)
+                if (scope != "compile") return scope
+            }
         }
         return "compile"
     }
