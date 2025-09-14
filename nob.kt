@@ -12,36 +12,56 @@ import org.w3c.dom.*
 const val DEBUG = false
 
 fun main(args: Array<String>) {
-    val opts = parse_args(args)
-    var nob = Nob(opts)
-    nob.rebuild_urself(args)
+    var nob = Nob.new(args)
 
     nob.resolve(
         Lib.of("io.ktor:ktor-server-netty:3.2.2"),
         Lib.of("org.slf4j:slf4j-simple:2.0.17"),
     )
 
-    when {
-        opts.test -> {
-            nob.compile(opts.test_dir.toFile())
+    when (val cmd = Cmd.next(args)) {
+        "run" -> nob.run_target()
+        "test" -> {
+            nob.compile(nob.opts.test_dir.toFile(), nob.opts.compile_classpath())
             nob.run_test(args)
         }
-        opts.run -> nob.run_target()
-        else -> nob.compile(opts.src_dirs.first().toFile())
+        else -> nob.compile(nob.opts.src_dirs.first().toFile(), nob.opts.compile_classpath())
     }
 
     nob.exit()
 }
 
-class Nob(private val opts: Opts) {
+object Cmd {
+    private var pos = 1 // skip KOTLIN_HOME
+    fun next(args: Array<String>) = args.getOrNull(pos++)
+}
+
+class Nob(val opts: Opts) {
     private var exit_code = 0
+
+    companion object {
+        fun new(args: Array<String>): Nob {
+            var pos = 0
+            var opts = Opts(kotlin_dir = args.get(pos++).let(Paths::get))
+            while(true) {
+                when (val arg = args.getOrNull(pos++)) {
+                    "debug" -> opts.debug = true
+                    null -> break
+                }
+            }
+            val nob = Nob(opts)
+            nob.rebuild_urself(args)
+            return nob
+        }
+    }
+
     fun exit() = System.exit(exit_code)
 
     fun resolve(vararg libs: Lib) {
         opts.libs = solve_libs(opts, libs.toList())
     }
 
-    fun compile(src: File) {
+    fun compile(src: File, classpath: String) {
         val start_time = System.nanoTime()
         val files = when {
             src.isFile() -> listOf(src)
@@ -55,46 +75,44 @@ class Nob(private val opts: Opts) {
         }
 
         if (should_compile) {
-            compile_with_daemon(src.toPath() == opts.nob_src)
+            compile_with_daemon(files, classpath)
         }
 
         info("Compiled ${Paths.get(opts.cwd).relativize(src.toPath())} in " + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start_time) + " ms")
     }
 
     fun run_test(args: Array<String>) {
-        if (opts.verbose) info("Testing ${opts.main_src}")
-        exec(
-            buildList {
-                add("java")
-                add("-Dfile.encoding=UTF-8")
-                add("-Dsun.stdout.encoding=UTF-8")
-                add("-Dsun.stderr.encoding=UTF-8")
-                if (opts.debug) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
-                add("-cp")
-                add(opts.test_classpath())
-                add(opts.main_class(opts.main_src.toFile()))
-                args.drop(2).forEach { add(it) }
-            },
-        )
+        info("Testing ${opts.main_src}")
+        val cmd = buildList{
+            add("java")
+            add("-Dfile.encoding=UTF-8")
+            add("-Dsun.stdout.encoding=UTF-8")
+            add("-Dsun.stderr.encoding=UTF-8")
+            if (opts.debug) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
+            add("-cp")
+            add(opts.test_classpath())
+            add(opts.main_class(opts.main_src.toFile()))
+            args.drop(2).forEach { add(it) }
+        }
+        exec(*cmd.toTypedArray())
     }
 
     fun run_target() {
-        if (opts.verbose) info("Running ${opts.main_src}")
-        exec(
-            buildList {
-                add("java")
-                add("-Dfile.encoding=UTF-8")
-                add("-Dsun.stdout.encoding=UTF-8")
-                add("-Dsun.stderr.encoding=UTF-8")
-                if (opts.debug) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
-                add("-cp")
-                add(opts.runtime_classpath())
-                add(opts.main_class(opts.main_src.toFile()))
-            },
-        )
+        info("Running ${Paths.get(opts.cwd).relativize(opts.main_src)}")
+        val cmd = buildList{
+            add("java")
+            add("-Dfile.encoding=UTF-8")
+            add("-Dsun.stdout.encoding=UTF-8")
+            add("-Dsun.stderr.encoding=UTF-8")
+            if (opts.debug) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
+            add("-cp")
+            add(opts.runtime_classpath())
+            add(opts.main_class(opts.main_src.toFile()))
+        }
+        exec(*cmd.toTypedArray())
     }
 
-    fun release(jar_name: String) {
+    fun release_lib(jar_name: String) {
         val start_time = System.nanoTime()
         val lib_jar_file = opts.target_dir.resolve("$jar_name.jar").toFile()
         exec("jar", "cf", lib_jar_file.absolutePath, "-C", opts.target_dir.toAbsolutePath().toString(), ".")
@@ -102,36 +120,30 @@ class Nob(private val opts: Opts) {
         info("Released $jar_name in " + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start_time) + " ms")
     }
 
-    fun release(jar_name: String, main_class_fq: String) {
+    fun release_app(jar_name: String, main_class_fq: String) {
         val startTime = System.nanoTime()
         val fatJarFile = opts.target_dir.resolve("$jar_name.jar").toFile()
-
         val addedEntries = mutableSetOf<String>()
 
         JarOutputStream(FileOutputStream(fatJarFile)).use { jar ->
-            // Add manifest
-            val manifest = java.util.jar.Manifest().apply {
-                mainAttributes.put(java.util.jar.Attributes.Name.MANIFEST_VERSION, "1.0")
-                mainAttributes.put(java.util.jar.Attributes.Name.MAIN_CLASS, main_class_fq)
+            val manifest = Manifest().apply {
+                mainAttributes.put(Attributes.Name.MANIFEST_VERSION, "1.0")
+                mainAttributes.put(Attributes.Name.MAIN_CLASS, main_class_fq)
             }
             JarOutputStream(FileOutputStream(fatJarFile), manifest).use { jarStream ->
-
-                // Helper for adding file
                 fun addFile(file: File, baseDir: File) {
                     val entryName = baseDir.toPath().relativize(file.toPath()).toString().replace("\\", "/")
-                    if (addedEntries.add(entryName)) { // only add if not added yet
+                    if (addedEntries.add(entryName)) {
                         jarStream.putNextEntry(JarEntry(entryName))
                         file.inputStream().use { it.copyTo(jarStream) }
                         jarStream.closeEntry()
                     }
                 }
 
-                // Add compiled classes
                 opts.target_dir.toFile().walkTopDown()
                     .filter { it.isFile && it.extension == "class" }
                     .forEach { addFile(it, opts.target_dir.toFile()) }
 
-                // Add dependency JARs
                 opts.libs.forEach { lib ->
                     if (lib.jar_file.exists()) {
                         java.util.zip.ZipFile(lib.jar_file).use { zip ->
@@ -153,26 +165,16 @@ class Nob(private val opts: Opts) {
         info("Released $jar_name in " + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTime) + " ms → ${fatJarFile.absolutePath}")
     }
 
-    fun exec(vararg cmd: String)  = exec(cmd.toList())
-
-    fun exec(cmd: List<String>) {
+    fun exec(vararg cmd: String) {
         if (opts.verbose) info(cmd.joinToString(" "))
-        exit_code = java.lang.ProcessBuilder(cmd)
+        exit_code = java.lang.ProcessBuilder(*cmd)
             .inheritIO()
             .directory(File(opts.cwd))
             .start()
             .waitFor()
     }
 
-    private fun compile_with_daemon(is_urself: Boolean = false) {
-        val compiler_id = CompilerId.makeCompilerId(Files.list(opts.kotlin_dir).filter { it.toString().endsWith(".jar") }.map { it.toFile() }.toList())
-        val client_alive_file = opts.target_dir.resolve(".alive").toFile().apply { if (!exists()) createNewFile() }
-
-        val classpath = when (is_urself){
-            true -> opts.nob_compile_classpath()
-            else -> opts.compile_classpath()
-        }
-
+    private fun compile_with_daemon(files: List<File>, classpath: String) {
         val args = buildList {
             add("-d")
             add(opts.target_dir.toString())
@@ -188,24 +190,19 @@ class Nob(private val opts: Opts) {
             if (opts.debug) add("-Xdebug")
             if (opts.extra) add("-Wextra")
             if (opts.error) add("-Werror")
-            if (is_urself) { add(opts.nob_src.toFile().absolutePath) }
-            opts.src_dirs.forEach { add(it.toString()) }
+            files.forEach { add(it.absolutePath) }
         }
         if (opts.verbose) info("kotlinc ${args.joinToString(" ")}")
-
+        val client_alive_file = opts.target_dir.resolve(".alive").toFile().apply { if (!exists()) createNewFile() }
         val daemon_reports = arrayListOf<DaemonReportMessage>()
-
         val daemon = KotlinCompilerClient.connectToCompileService(
-            compilerId = compiler_id,
+            compilerId = CompilerId.makeCompilerId(Files.list(opts.kotlin_dir).filter { it.toString().endsWith(".jar") }.map { it.toFile() }.toList()),
             clientAliveFlagFile = client_alive_file,
             daemonJVMOptions = DaemonJVMOptions(),
             daemonOptions = DaemonOptions(verbose = opts.verbose),
             reportingTargets = DaemonReportingTargets(out = if (opts.verbose) System.out else null, messages = daemon_reports),
             autostart = true,
-        ) ?: error("unable to connect to compiler daemon: " + 
-            daemon_reports.joinToString("\n  ", prefix = "\n  ") { 
-                "${it.category.name} ${it.message}"
-            })
+        ) ?: error("unable to connect to compiler daemon: " + daemon_reports.joinToString("\n  ", prefix = "\n  ") { "${it.category.name} ${it.message}" })
 
         val session_id = daemon.leaseCompileSession(client_alive_file.absolutePath).get()
         try {
@@ -223,22 +220,23 @@ class Nob(private val opts: Opts) {
         }
     }
 
-    fun rebuild_urself(args: Array<String>) {
+    private fun rebuild_urself(args: Array<String>) {
         val nob_class_file = opts.main_class(opts.nob_src.toFile())
             .split(".")
             .fold(opts.target_dir) { acc, next -> acc.resolve(next) }
             .let { File(it.toFile().absolutePath + ".class").toPath() }
 
         if(Files.getLastModifiedTime(opts.nob_src).toInstant() > Files.getLastModifiedTime(nob_class_file).toInstant()) {
-            compile(opts.nob_src.toFile())
-
-            java.lang.ProcessBuilder(
+            compile(
+                src = opts.nob_src.toFile(),
+                classpath = opts.nob_compile_classpath(),
+            )
+            exec(
                 "java",
                 "-cp", "out:${System.getProperty("java.class.path")}",
                 "nob.NobKt",
                 *args
-            ).inheritIO().start().waitFor()
-
+            )
             exit()
         } 
     }
@@ -249,19 +247,6 @@ class Nob(private val opts: Opts) {
         val package_path = pkg?.replace('.', File.separatorChar) ?: ""
         return opts.target_dir.resolve(package_path).resolve("$class_name.class").toFile()
     }
-}
-
-private fun parse_args(args: Array<String>): Opts {
-    var pos = 0
-    var opts = Opts(kotlin_dir = args.get(pos++).let(Paths::get))
-    while(true) {
-        when (val arg = args.getOrNull(pos++)) {
-            "debug" -> {opts.debug = true; opts.run = true }
-            "run" -> opts.run = true
-            null -> break
-        }
-    }
-    return opts
 }
 
 data class Opts(
@@ -281,15 +266,14 @@ data class Opts(
     var debug: Boolean = false,
     var error: Boolean = true,
     var extra: Boolean = false,
-    var run: Boolean = false,
-    var test: Boolean = false,
-    var release: Boolean = false,
 ) {
-    val main_src: Path get() = src_dirs.asSequence()
+    val main_srcs: List<Path> get() = src_dirs.asSequence()
         .flatMap { Files.walk(it).asSequence() }
         .filter { it.toFile().isFile() }
         .filter { it.toFile().readText().contains("fun main(") }
-        .firstOrNull() ?: error("no main() found")
+        .toList()
+
+    val main_src: Path get() = main_srcs.firstOrNull() ?: error("no main() found")
 
     fun runtime_classpath(): String {
         val libs_paths = libs.filter { it.scope == "compile" || it.scope == "runtime" }
@@ -326,7 +310,7 @@ data class Opts(
 
     fun main_class(src: File): String { 
         val pkg = src.useLines { lines -> lines.firstOrNull { it.trim().startsWith("package ") }?.removePrefix("package ")?.trim() }
-        val main = src.toPath().fileName.toString().removeSuffix(".kt").lowercase().replaceFirstChar{ it.uppercase() } + "Kt"
+        val main = src.toPath().fileName.toString().removeSuffix(".kt").replaceFirstChar{ it.uppercase() } + "Kt"
         return when (pkg) {
             null -> "$main"
             else -> "$pkg.$main"
