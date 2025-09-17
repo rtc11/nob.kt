@@ -17,4 +17,4 @@ if [ ! -f out/nob/NobKt.class ]; then
     kotlinc nob.kt -cp "$LIBS" -d out
 fi
 
-java -cp "out:$LIBS" nob.NobKt "$KOTLIN_LIB" $@
+java -cp "out:$LIBS" nob.NobKt $@
