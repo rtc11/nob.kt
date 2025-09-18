@@ -12,10 +12,10 @@ import org.w3c.dom.*
 const val DEBUG = false
 
 fun main(args: Array<String>) {
-
     val nob = Nob.new(args)
 
     nob.module {
+        name = "example"
         src = "example"
         libs = listOf(
             Lib.of("io.ktor:ktor-server-netty:3.2.2"),
@@ -28,14 +28,12 @@ fun main(args: Array<String>) {
         args.getOrNull(0) == "run" -> nob.run(args)
         args.getOrNull(0) == "test" -> nob.test(args)
         args.getOrNull(0) == "release" -> {
-            var module = nob.modules.filter { it.src in args }.firstOrNull() ?: nob.modules.filter { it.src != "nob.kt" }.firstOrNull() 
-            if (module == null) {
-                TODO("found no modules to release")
-                System.exit(1)
-            }
+            var module = nob.modules.filter { it.name in args }.firstOrNull() 
+                ?: nob.modules.firstOrNull { it.name != "nob" }
+                ?: error("no modules provided")
 
             val main_class = nob.main_srcs().filter { !it.toAbsolutePath().toString().endsWith("nob.kt")}.first().main_class()
-            nob.release(module, module.src, main_class)
+            nob.release(module, main_class)
         }
         else -> nob.compile(args)
     }
@@ -61,6 +59,7 @@ class Nob(val opts: Opts) {
             if (arg == "debug") opts.debug = true
             val nob = Nob(opts)
             val module = nob.module {
+                name = "nob"
                 src = "nob.kt"
                 target = "out"
             }
@@ -84,11 +83,9 @@ class Nob(val opts: Opts) {
     }
 
     fun compile(args: Array<String>) {
-        var module = modules.filter { it.src in args }.firstOrNull() ?: modules.filter { it.src != "nob.kt" }.firstOrNull() 
-        if (module == null) {
-            TODO("found no modules to compile")
-            System.exit(1)
-        }
+        var module = modules.filter { it.name in args }.firstOrNull() 
+            ?: modules.firstOrNull { it.name != "nob" } 
+            ?: error("no module found")
         compile(module, module.compile_cp())
     }
 
@@ -106,7 +103,7 @@ class Nob(val opts: Opts) {
             compiled == null || file.lastModified() > compiled.lastModified()
         }
         if (has_changes) {
-            compile_with_daemon(src, target, classpath)
+            compile_with_daemon(src, target, classpath, module.name)
             pkg_dir_cache.clear()
             pkg_cache.clear()
             info("Compiled ${Paths.get(System.getProperty("user.dir")).relativize(src.toPath())} ${stop(start_time)}")
@@ -117,11 +114,7 @@ class Nob(val opts: Opts) {
 
     fun test(args: Array<String>) {
         val start_time = System.nanoTime()
-        var module = modules.filter { it.src in args }.firstOrNull() ?: modules.filter { it.src != "nob.kt" }.firstOrNull() 
-        if (module == null) {
-            TODO("found no modules to test")
-            System.exit(1)
-        }
+        var module = modules.filter { it.src in args }.firstOrNull() ?: modules.filter { it.src != "nob.kt" }.firstOrNull() ?: error("no modules found") 
         val main_class = main_srcs().first { it.toFile().name == "Tester.kt" }.main_class()
         val cmd = buildList{
             add("java")
@@ -139,11 +132,7 @@ class Nob(val opts: Opts) {
     }
 
     fun run(args: Array<String>) {
-        var module = modules.filter { it.src in args }.firstOrNull() ?: modules.filter { it.src != "nob.kt" }.firstOrNull() 
-        if (module == null) {
-            TODO("found no modules to test")
-            System.exit(1)
-        }
+        var module = modules.filter { it.src in args }.firstOrNull() ?: modules.filter { it.src != "nob.kt" }.firstOrNull() ?: error("no modules found") 
         val main_class = main_srcs().filter { !it.toAbsolutePath().toString().endsWith("nob.kt")}.first().main_class()
         info("Running $main_class")
         val cmd = buildList{
@@ -159,18 +148,32 @@ class Nob(val opts: Opts) {
         exec(*cmd.toTypedArray())
     }
 
-    fun release(module: Module, jar_name: String) {
+    /** release jar without libs */
+    fun release(module: Module, main_class_fq: String? = null, compiled_dir: String? = null) {
         val start_time = System.nanoTime()
-        val lib_jar_file = path(module.target).resolve("$jar_name.jar").toFile()
-        exec("jar", "cf", lib_jar_file.absolutePath, "-C", path(module.target).toAbsolutePath().toString(), ".")
-        if (exit_code != 0) err("Failed to release $jar_name")
-        info("Released $jar_name ${stop(start_time)}")
+        val compiled_dir = compiled_dir ?: module.src.substringBeforeLast(File.separator)
+        if (main_class_fq == null) {
+            exec(
+                "jar", "cf", "${module.target}/${module.name}.jar",
+                "-C", module.target, "META-INF/${module.name}.kotlin_module",
+                "-C", module.target, compiled_dir
+            )
+        } else {
+            exec(
+                "jar", "cfe", "${module.target}/${module.name}.jar",
+                main_class_fq,
+                "-C", module.target, compiled_dir
+            )
+        }
+        if (exit_code != 0) err("Failed to release ${module.name}.jar")
+        info("Released ${module.name}.jar ${stop(start_time)}")
     }
 
-    fun release(module: Module, jar_name: String, main_class_fq: String) {
+    /** release executable fat jar with libs */
+    fun release_fat(module: Module, main_class_fq: String) {
         val start_time = System.nanoTime()
         val target_dir = path(module.target)
-        val fat_jar_file = target_dir.resolve("$jar_name.jar").toFile()
+        val fat_jar_file = target_dir.resolve("${module.name}-fat.jar").toFile()
         val added_entries = mutableSetOf<String>()
         JarOutputStream(FileOutputStream(fat_jar_file)).use { jar ->
             val manifest = Manifest().apply {
@@ -206,23 +209,26 @@ class Nob(val opts: Opts) {
                 }
             }
         }
-        info("Released $jar_name ${stop(start_time)}")
+        info("Released ${module.name}-fat.jar ${stop(start_time)}")
     }
 
     fun exec(vararg cmd: String) {
         if (opts.verbose) info(cmd.joinToString(" "))
+        // info(cmd.joinToString(" "))
         exit_code = java.lang.ProcessBuilder(*cmd).inheritIO().start().waitFor()
     }
 
     private val kotlin_home = Paths.get(System.getenv("KOTLIN_HOME"), "libexec", "lib")
     private val kotlin_libs = listOf("kotlin-stdlib.jar", "kotlin-compiler.jar", "kotlin-daemon.jar", "kotlin-daemon-client.jar").joinToString(File.pathSeparator) { kotlin_home.resolve(it).toAbsolutePath().normalize().toString() }
 
-    private fun compile_with_daemon(src: File, target: Path, classpath: String, retries: Int = 3) {
+    private fun compile_with_daemon(src: File, target: Path, classpath: String, name: String, retries: Int = 3) {
         val args = buildList {
             add("-d")
             add(target.toString())
             add("-jvm-target")
             add(opts.jvm_version.toString())
+            add("-module-name")
+            add(name)
             add("-Xbackend-threads=${opts.backend_threads}")
             if (!opts.debug) add("-Xno-optimize")
             add("-Xuse-fast-jar-file-system")
@@ -264,7 +270,7 @@ class Nob(val opts: Opts) {
             }
         } catch (e: IllegalStateException) {
             daemon.shutdown()
-            if (retries > 0) compile_with_daemon(src, target, classpath, retries-1)
+            if (retries > 0) compile_with_daemon(src, target, classpath, name, retries-1)
             else throw e
             return
         }
@@ -328,11 +334,13 @@ fun List<Path>.into_cp(): String = joinToString(File.pathSeparator) { it.toAbsol
 fun path(str: String): Path = Paths.get(System.getProperty("user.dir"), str).also { it.toFile().mkdirs() }
 
 data class Module(
+    var name: String = "app",
     var src: String = "src",
     var res: String = "res",
     var test: String = "test",
     var target: String = "out",
     var libs: List<Lib> = emptyList(), 
+    var modules: List<Module> = emptyList(),
 ) {
     fun compile_cp(): String { 
         val libs = libs.filter { it.scope in listOf("compile") }.map { it.jar_path }.into_cp() 
@@ -614,10 +622,7 @@ class MavenResolver {
             val type = node["type"] ?: "jar"
             if (type == "pom" && scope == "import") continue
             val declared_version = node["version"]
-            val version = when(declared_version) {
-                null -> find_managed_version(LibKey(group, artifact), pom)
-                else -> resolve_property_lazy(declared_version, pom)
-            }
+            val version = resolve_best_version(LibKey(group, artifact), declared_version, pom)
             if (version != null) {
                 resolved.add(ResolvedLib(Lib(group, artifact, version, scope, type), "maven"))
             } else {
@@ -625,6 +630,42 @@ class MavenResolver {
             }
         }
         return resolved
+    }
+
+    private fun resolve_best_version(key: LibKey, declared_version: String?, pom: Document): String? {
+        val candidates = mutableSetOf<String>()
+        if (declared_version != null) {
+            val resolved = resolve_property_lazy(declared_version, pom)
+            if (resolved != null) candidates.add(resolved)
+        }
+        find_managed_version_candidates(key, pom, candidates)
+        return candidates.maxWithOrNull(::compare_version)
+    }
+    private fun compare_version(v1: String, v2: String): Int {
+        val parts1 = v1.split('.').map { it.toIntOrNull() ?: 0 }
+        val parts2 = v2.split('.').map { it.toIntOrNull() ?: 0 }
+        for (i in 0 until maxOf(parts1.size, parts2.size)) {
+            val p1 = parts1.getOrElse(i) { 0 }
+            val p2 = parts2.getOrElse(i) { 0 }
+            if (p1 != p2) return p1.compareTo(p2)
+        }
+        return 0
+    }
+    private fun find_managed_version_candidates(key: LibKey, pom: Document, candidates: MutableSet<String>) {
+        val managed_libs = get_managed_libs(pom)
+        val managed_lib = managed_libs[key]
+        if (managed_lib != null) {
+            val resolved_version = resolve_property_lazy(managed_lib.version, pom)
+            if (resolved_version != null) candidates.add(resolved_version)
+        }
+        val parent_lib = get_parent_lib(pom)
+        if (parent_lib != null) {
+            get_doc(parent_lib)?.let { doc -> find_managed_version_candidates(key, doc, candidates)}
+        }
+        val boms = get_boms(pom)
+        for (bom_lib in boms) {
+            get_doc(bom_lib)?.let { doc -> find_managed_version_candidates(key, doc, candidates)}
+        }
     }
 
     private fun get_doc(lib: Lib): Document? {
@@ -723,7 +764,8 @@ class MavenResolver {
                     val group = node["groupId"] ?: continue
                     val artifact = node["artifactId"] ?: continue
                     val version = node["version"] ?: continue
-                    boms.add(Lib(group, artifact, version))
+                    val resolved_version = resolve_property_lazy(version, pom) ?: continue
+                    boms.add(Lib(group, artifact, resolved_version))
                 }
             }
             boms
@@ -753,10 +795,11 @@ class MavenResolver {
 
     private fun resolve_property_lazy(prop: String?, pom: Document): String? {
         if (prop == null) return null
-        when (prop) {
-            "\${project.groupId}" -> return pom.getElementsByTagName("groupId").item(0)?.textContent?.trim() ?: pom.getElementsByTagName("parent").item(0)?.let { it as? Element }?.get("groupId")
-            "\${project.artifactId}" -> return pom.getElementsByTagName("artifactId").item(0)?.textContent?.trim()
-            "\${project.version}" -> return pom.getElementsByTagName("version").item(0)?.textContent?.trim() ?: pom.getElementsByTagName("parent").item(0)?.let { it as? Element }?.get("version")
+      when (prop) {
+            "\${project.version}" -> return pom.getElementsByTagName("project").item(0)?.let { it as Element }?.get_direct_child("version")?.textContent?.trim() ?: pom.getElementsByTagName("parent").item(0)?.let { it as? Element }?.get("version")
+            "\${project.groupId}" -> return pom.getElementsByTagName("project").item(0)?.let { it as Element }?.get_direct_child("groupId")?.textContent?.trim() ?: pom.getElementsByTagName("parent").item(0)?.let { it as? Element }?.get("groupId")
+            "\${project.artifactId}" -> return pom.getElementsByTagName("project").item(0)?.let { it as Element }?.get_direct_child("artifactId")?.textContent?.trim()
+            "\${project.parent.version}" -> return pom.getElementsByTagName("parent").item(0)?.let { it as? Element }?.get("version")
         }
         if (!prop.matches(Regex("""\$\{(.+?)}"""))) {
             return prop
