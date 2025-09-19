@@ -38,10 +38,10 @@ fun main(args: Array<String>) {
 
     nob.exit()
 }
-
 class Nob(val opts: Opts) {
     private var exit_code = 0
     var modules = mutableListOf<Module>()
+    var compiled = mutableListOf<Module>()
 
     fun module(block: Module.() -> Unit): Module {
         val module = Module().apply(block)
@@ -84,26 +84,25 @@ class Nob(val opts: Opts) {
         var module = modules.filter { it.name in args }.firstOrNull() 
             ?: modules.firstOrNull { it.name != "nob" } 
             ?: error("no module found")
-        compile(module, module.compile_cp())
+        compile(module)
     }
 
-    fun compile(module: Module, classpath: String) {
+    fun compile(module: Module) {
         val start_time = System.nanoTime()
+        if (module in compiled) return
+        module.modules.forEach { compile(it) }
         val src = path(module.src).toFile()
-        val target = path(module.target)
         val sources: Sequence<File> = when {
             src.isFile -> sequenceOf(src)
             src.isDirectory -> src.walkTopDown().filter { it.isFile && it.extension == "kt" }
             else -> emptySequence()
         }
-        val has_changes = sources.any { file -> 
-            val compiled = get_any_compiled_file(file, target)
-            compiled == null || file.lastModified() > compiled.lastModified()
-        }
+        val compile_dir = path("${module.target}/${module.compile_dir()}").toFile()
+        val any_compiled_target_file = get_any_compiled_file(compile_dir)
+        val has_changes = sources.any { file -> file.lastModified() > any_compiled_target_file?.lastModified() ?: 0 }
+        compiled.add(module)
         if (has_changes) {
-            compile_with_daemon(src, target, classpath, module.name)
-            pkg_dir_cache.clear()
-            pkg_cache.clear()
+            compile_with_daemon(src, path(module.target), module.compile_cp(), module.name)
             info("Compiled ${Paths.get(System.getProperty("user.dir")).relativize(src.toPath())} ${stop(start_time)}")
         } else {
             info("${Paths.get(System.getProperty("user.dir")).relativize(src.toPath())} is up to date ${stop(start_time)}")
@@ -288,28 +287,18 @@ class Nob(val opts: Opts) {
             .fold(path(module.target)) { acc, next -> acc.resolve(next) }
             .let { File(it.toFile().absolutePath + ".class").toPath() }
         if(Files.getLastModifiedTime(nob_src).toMillis() > Files.getLastModifiedTime(nob_class_file).toMillis()) {
-            compile(module, module.compile_cp())
+            compile(module)
             exec("java", "-cp", "out:${System.getProperty("java.class.path")}", "nob.NobKt", *args)
             exit()
         } 
     }
 
-    private val pkg_cache = mutableMapOf<File, String>()         // src file → package name
-    private val pkg_dir_cache = mutableMapOf<Path, List<File>>() // target package dir → compiled class files
-    private fun get_package(src: File): String? = pkg_cache.getOrPut(src) {
-        src.bufferedReader().useLines { lines -> 
-            lines.firstOrNull { it.trim().startsWith("package ") }?.removePrefix("package ")?.trim() 
-        } ?: ""
-    }.ifEmpty { null }
-
-    private fun get_any_compiled_file(src: File, target: Path): File? {
-        val base_name = src.nameWithoutExtension.replaceFirstChar { it.uppercase() }
-        val pkg = get_package(src)
-        val pkg_dir = pkg?.replace('.', File.separatorChar)?.let { target.resolve(it) } ?: target
-        val compiled_files = pkg_dir_cache.getOrPut(pkg_dir) {
-            pkg_dir.toFile().listFiles { f -> f.isFile && f.extension == "class" }?.toList() ?: emptyList()
+    private fun get_any_compiled_file(dir: File): File? {
+        return when {
+            dir.isFile -> dir
+            dir.isDirectory -> dir.walkTopDown().firstOrNull { it.isFile && it.extension == "class" }
+            else -> null
         }
-        return compiled_files.firstOrNull { it.name.startsWith(base_name) }
     }
 }
 
@@ -335,6 +324,8 @@ fun Path.main_class_fq(): String {
 
 fun List<Path>.into_cp(): String = joinToString(File.pathSeparator) { it.toAbsolutePath().normalize().toString() }
 fun path(str: String): Path = Paths.get(System.getProperty("user.dir"), str).also { it.toFile().mkdirs() }
+
+enum class Classpath { Compile, Runtime, Test }
 
 data class Module(
     var name: String = "app",
@@ -367,6 +358,12 @@ data class Module(
     }
 
     fun main_src(): Path? = Files.walk(path(src)).asSequence().singleOrNull { Files.isRegularFile(it) && it.toFile().readText().contains("fun main(") }
+
+    fun compile_dir(): String = main_src()
+        ?.main_class_fq() // apps may not use longer package namespaces like libs
+        ?.substringBeforeLast('.')
+        ?.replace('.', File.separatorChar) 
+        ?: src.substringBeforeLast(File.separator)
 }
 
 private val jar_cache_dir = Paths.get(System.getProperty("user.home"), ".nob_cache").also { it.toFile().mkdirs() }
@@ -732,31 +729,6 @@ class MavenResolver {
         return null
     }
 
-    private fun find_managed_version(key: LibKey, pom: Document): String? {
-        val managed_deps = get_managed_libs(pom)
-        val managed_lib = managed_deps[key]
-        if (managed_lib != null) {
-            val resolved_version = resolve_property_lazy(managed_lib.version, pom)
-            if (resolved_version != null) return resolved_version
-        }
-        val parent_lib = get_parent_lib(pom)
-        if (parent_lib != null) {
-            get_doc(parent_lib)?.let { doc ->
-                val version = find_managed_version(key, doc)
-                if (version != null) return version
-            }
-        }
-        val boms = get_boms(pom)
-        for (bom_lib in boms) {
-            get_doc(bom_lib)?.let { doc ->
-                find_managed_version(key, doc)?.let { version ->
-                    return version
-                }
-            }
-        }
-        return null
-    }
-
     private fun get_boms(pom: Document): Set<Lib> {
         return boms_cache.getOrPut(lib(pom)) {
             val dm = pom.getElementsByTagName("dependencyManagement")
@@ -997,3 +969,4 @@ class JsonParser(private val text: String) {
     }
     private fun peek(): Char = if (i < text.length) text[i] else '\u0000'
 }
+
