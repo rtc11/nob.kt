@@ -39,12 +39,10 @@ fun main(args: Array<String>) {
         args.getOrNull(0) == "run" -> nob.run(args)
         args.getOrNull(0) == "test" -> nob.test(args)
         args.getOrNull(0) == "release" -> {
-            var module = nob.modules.filter { it.name in args }.firstOrNull() 
-                ?: nob.modules.firstOrNull { it.name != "nob" }
-                ?: error("no modules provided")
-
-            val main_class = nob.main_srcs().filter { !it.toAbsolutePath().toString().endsWith("nob.kt")}.first().main_class()
-            nob.release(module, main_class)
+            when (val name = args.getOrNull(1)) {
+                null -> nob.modules.filter { it.name != "nob" }.forEach { nob.release(it) }
+                else -> nob.release(nob.modules.single { it.name == name })
+            }
         }
         else -> nob.compile(args)
     }
