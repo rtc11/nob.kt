@@ -28,12 +28,10 @@ fun main(args: Array<String>) {
         args.getOrNull(0) == "run" -> nob.run(args)
         args.getOrNull(0) == "test" -> nob.test(args)
         args.getOrNull(0) == "release" -> {
-            var module = nob.modules.filter { it.name in args }.firstOrNull() 
-                ?: nob.modules.firstOrNull { it.name != "nob" }
-                ?: error("no modules provided")
-
-            val main_class = nob.main_srcs().filter { !it.toAbsolutePath().toString().endsWith("nob.kt")}.first().main_class()
-            nob.release(module, main_class)
+            when (val name = args.getOrNull(1)) {
+                null -> nob.modules.filter { it.name != "nob" }.forEach { nob.release(it) }
+                else -> nob.release(nob.modules.single { it.name == name })
+            }
         }
         else -> nob.compile(args)
     }
@@ -99,7 +97,7 @@ class Nob(val opts: Opts) {
             else -> emptySequence()
         }
         val has_changes = sources.any { file -> 
-            val compiled = get_any_compiled_file(file)
+            val compiled = get_any_compiled_file(file, target)
             compiled == null || file.lastModified() > compiled.lastModified()
         }
         if (has_changes) {
@@ -114,8 +112,12 @@ class Nob(val opts: Opts) {
 
     fun test(args: Array<String>) {
         val start_time = System.nanoTime()
-        var module = modules.filter { it.src in args }.firstOrNull() ?: modules.filter { it.src != "nob.kt" }.firstOrNull() ?: error("no modules found") 
-        val main_class = main_srcs().first { it.toFile().name == "Tester.kt" }.main_class()
+        var module = modules.filter { it.src in args }.firstOrNull() ?: modules.filter { it.src != "nob.kt" }.firstOrNull() 
+        if (module == null) {
+            TODO("found no modules to test")
+            System.exit(1)
+        }
+        val main_class_fq = main_srcs().first { it.toFile().name == "Tester.kt" }.main_class_fq()
         val cmd = buildList{
             add("java")
             add("-Dfile.encoding=UTF-8")
@@ -124,7 +126,7 @@ class Nob(val opts: Opts) {
             if (opts.debug) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
             add("-cp")
             add(module.test_compile_cp())
-            add(main_class)
+            add(main_class_fq)
             args.drop(2).forEach { add(it) }
         }
         exec(*cmd.toTypedArray())
@@ -132,9 +134,13 @@ class Nob(val opts: Opts) {
     }
 
     fun run(args: Array<String>) {
-        var module = modules.filter { it.src in args }.firstOrNull() ?: modules.filter { it.src != "nob.kt" }.firstOrNull() ?: error("no modules found") 
-        val main_class = main_srcs().filter { !it.toAbsolutePath().toString().endsWith("nob.kt")}.first().main_class()
-        info("Running $main_class")
+        var module = modules.filter { it.src in args }.firstOrNull() ?: modules.filter { it.src != "nob.kt" }.firstOrNull() 
+        if (module == null) {
+            warn("found no modules to test")
+            return
+        }
+        val main_class_fq = main_srcs().filter { !it.toAbsolutePath().toString().endsWith("nob.kt")}.first().main_class_fq()
+        info("Running $main_class_fq")
         val cmd = buildList{
             add("java")
             add("-Dfile.encoding=UTF-8")
@@ -143,15 +149,15 @@ class Nob(val opts: Opts) {
             if (opts.debug) add("-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005")
             add("-cp")
             add(module.runtime_cp())
-            add(main_class)
+            add(main_class_fq)
         }
         exec(*cmd.toTypedArray())
     }
 
-    /** release jar without libs */
-    fun release(module: Module, main_class_fq: String? = null, compiled_dir: String? = null) {
+    fun release(module: Module) {
         val start_time = System.nanoTime()
-        val compiled_dir = compiled_dir ?: module.src.substringBeforeLast(File.separator)
+        val main_class_fq = module.main_src()?.main_class_fq()
+        val compiled_dir = main_class_fq?.substringBeforeLast('.')?.replace('.', File.separatorChar) ?: module.src.substringBeforeLast(File.separator)
         if (main_class_fq == null) {
             exec(
                 "jar", "cf", "${module.target}/${module.name}.jar",
@@ -169,9 +175,9 @@ class Nob(val opts: Opts) {
         info("Released ${module.name}.jar ${stop(start_time)}")
     }
 
-    /** release executable fat jar with libs */
-    fun release_fat(module: Module, main_class_fq: String) {
+    fun release_fat(module: Module) {
         val start_time = System.nanoTime()
+        val main_class_fq = module.main_src()!!.main_class_fq()
         val target_dir = path(module.target)
         val fat_jar_file = target_dir.resolve("${module.name}-fat.jar").toFile()
         val added_entries = mutableSetOf<String>()
@@ -214,7 +220,6 @@ class Nob(val opts: Opts) {
 
     fun exec(vararg cmd: String) {
         if (opts.verbose) info(cmd.joinToString(" "))
-        // info(cmd.joinToString(" "))
         exit_code = java.lang.ProcessBuilder(*cmd).inheritIO().start().waitFor()
     }
 
@@ -278,7 +283,7 @@ class Nob(val opts: Opts) {
 
     private fun rebuild_urself(module: Module, args: Array<String>) {
         val nob_src = path(module.src)
-        val nob_class_file = nob_src.main_class()
+        val nob_class_file = nob_src.main_class_fq()
             .split(".")
             .fold(path(module.target)) { acc, next -> acc.resolve(next) }
             .let { File(it.toFile().absolutePath + ".class").toPath() }
@@ -291,22 +296,20 @@ class Nob(val opts: Opts) {
 
     private val pkg_cache = mutableMapOf<File, String>()         // src file → package name
     private val pkg_dir_cache = mutableMapOf<Path, List<File>>() // target package dir → compiled class files
-    private fun get_package(src: File): String? {
-        return pkg_cache.getOrPut(src) {
-            src.bufferedReader().useLines { lines -> 
-                lines.firstOrNull { it.trim().startsWith("package ") }?.removePrefix("package ")?.trim() 
-            } ?: ""
-        }.ifEmpty { null }
-    }
-    private fun get_any_compiled_file(src: File): File? {
-        val baseName = src.nameWithoutExtension.replaceFirstChar { it.uppercase() }
+    private fun get_package(src: File): String? = pkg_cache.getOrPut(src) {
+        src.bufferedReader().useLines { lines -> 
+            lines.firstOrNull { it.trim().startsWith("package ") }?.removePrefix("package ")?.trim() 
+        } ?: ""
+    }.ifEmpty { null }
+
+    private fun get_any_compiled_file(src: File, target: Path): File? {
+        val base_name = src.nameWithoutExtension.replaceFirstChar { it.uppercase() }
         val pkg = get_package(src)
-        val target =  path(modules.first().target) // FIXME: look for all the target dirs
         val pkg_dir = pkg?.replace('.', File.separatorChar)?.let { target.resolve(it) } ?: target
         val compiled_files = pkg_dir_cache.getOrPut(pkg_dir) {
             pkg_dir.toFile().listFiles { f -> f.isFile && f.extension == "class" }?.toList() ?: emptyList()
         }
-        return compiled_files.firstOrNull { it.name.startsWith(baseName) }
+        return compiled_files.firstOrNull { it.name.startsWith(base_name) }
     }
 }
 
@@ -324,7 +327,7 @@ fun Nob.main_srcs(): Sequence<Path> = modules.map { path(it.src) }.asSequence()
     .flatMap { Files.walk(it).asSequence() }
     .filter { Files.isRegularFile(it) && it.toFile().readText().contains("fun main(") }
 
-fun Path.main_class(): String { 
+fun Path.main_class_fq(): String { 
     val pkg = this.toFile().useLines { lines -> lines.firstOrNull { it.trim().startsWith("package ") }?.removePrefix("package ")?.trim() }
     val main = this.fileName.toString().removeSuffix(".kt").replaceFirstChar{ it.uppercase() } + "Kt"
     return pkg?.let { "$pkg.$main" } ?: main
@@ -362,6 +365,8 @@ data class Module(
         val res = path(res).toAbsolutePath().normalize().toString()
         return "$libs:$target:$test:$src:$res"
     }
+
+    fun main_src(): Path? = Files.walk(path(src)).asSequence().singleOrNull { Files.isRegularFile(it) && it.toFile().readText().contains("fun main(") }
 }
 
 private val jar_cache_dir = Paths.get(System.getProperty("user.home"), ".nob_cache").also { it.toFile().mkdirs() }
@@ -992,4 +997,3 @@ class JsonParser(private val text: String) {
     }
     private fun peek(): Char = if (i < text.length) text[i] else '\u0000'
 }
-
