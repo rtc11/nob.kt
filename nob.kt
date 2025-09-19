@@ -41,7 +41,7 @@ fun main(args: Array<String>) {
 class Nob(val opts: Opts) {
     private var exit_code = 0
     var modules = mutableListOf<Module>()
-    var compiled = mutableListOf<Module>()
+    var compiled = mutableSetOf<Module>()
 
     fun module(block: Module.() -> Unit): Module {
         val module = Module().apply(block)
