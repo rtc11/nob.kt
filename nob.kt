@@ -214,7 +214,7 @@ class Nob(val opts: Opts) {
 
     fun exec(vararg cmd: String) {
         if (opts.verbose) info(cmd.joinToString(" "))
-        info(cmd.joinToString(" "))
+        // info(cmd.joinToString(" "))
         exit_code = java.lang.ProcessBuilder(*cmd).inheritIO().start().waitFor()
     }
 
@@ -242,7 +242,7 @@ class Nob(val opts: Opts) {
             add(src.absolutePath)
         }
         if (opts.verbose) info("kotlinc ${args.joinToString(" ")}")
-        info("kotlinc ${args.joinToString(" ")}")
+        // info("kotlinc ${args.joinToString(" ")}")
         val client_alive_file = target.resolve(".alive").toFile().apply { if (!exists()) createNewFile() }
         val daemon_reports = arrayListOf<DaemonReportMessage>()
         val compiler_id = Files.list(kotlin_home).filter { it.toString().endsWith(".jar") }.map { it.toFile() }.toList()
@@ -335,7 +335,7 @@ data class Module(
         return when {
             src_target.isFile -> path("$target/$name")
             src_target.isDirectory -> path("$target/$src")
-            else -> error("file is not file or directory $src_target")
+            else -> error("'$src_target' is not a file nor a directory. Exists: ${src_target.exists()}")
         }
     }
 
