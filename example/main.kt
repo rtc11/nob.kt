@@ -1,5 +1,3 @@
-package example
-
 fun main() {
     // server()
     println("a")

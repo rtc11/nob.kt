@@ -14,24 +14,31 @@ const val DEBUG = false
 fun main(args: Array<String>) {
     val nob = Nob.new(args)
 
-    val example = nob.module {
-        name = "example"
-        src = "example"
+    // val example = nob.module {
+    //     name = "example"
+    //     src = "example"
+    //     libs = listOf(
+    //         Lib.of("io.ktor:ktor-server-netty:3.2.2"),
+    //         Lib.of("org.slf4j:slf4j-simple:2.0.17"),
+    //     )
+    // }
+
+    val test = nob.module {
+        name = "test"
+        src = "test.kt"
         libs = listOf(
-            Lib.of("io.ktor:ktor-server-netty:3.2.2"),
-            Lib.of("org.slf4j:slf4j-simple:2.0.17"),
+            Lib.of("org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.10.2"),
+            Lib.local("klib.jar"),
         )
     }
 
-    // val test = nob.module
-
     when {
-        args.getOrNull(0) == "run" -> nob.run(example, "example.MainKt", arrayOf())
-        // args.getOrNull(0) == "test" -> {
-        //     nob.compile(test)
-        //     nob.run(test, "test.TesterKt", arrayOf("-f", test.src_target().toAbsolutePath().normalize().toString()))
-        // }
-        args.getOrNull(0) == "release" -> nob.release(example)
+        // args.getOrNull(0) == "run" -> nob.run(example, "example.MainKt", arrayOf())
+        args.getOrNull(0) == "test" -> {
+            nob.compile(test)
+            nob.run(test, "test.TesterKt", arrayOf("-f", test.src_target().toAbsolutePath().normalize().toString()))
+        }
+        // args.getOrNull(0) == "release" -> nob.release(example)
         else -> nob.mods.filter { it.name != "nob" }.forEach { nob.compile(it) }
     }
 
@@ -133,26 +140,17 @@ class Nob(val opts: Opts) {
 
     fun release(module: Module) {
         val start_time = System.nanoTime()
-        val main_class_fq = module.main_src()?.main_class_fq()
-        val compiled_dir = main_class_fq?.substringBeforeLast('.')?.replace('.', File.separatorChar) ?: module.src.substringBeforeLast(File.separator)
-        if (main_class_fq == null) {
         val src_target = Paths.get(module.src).toFile()
-            val meta_inf = when {
-                src_target.isFile -> "${module.name}/META-INF/${module.name}.kotlin_module"
-                src_target.isDirectory -> "${module.src}/META-INF/${module.name}.kotlin_module"
-                else -> error ("src is not a file nor dir, cannot find the ${module.name}.kotlin_module")
-            }
-            exec(
-                "jar", "cf", "${module.target}/${module.name}.jar",
-                "-C", module.target, meta_inf,
-                "-C", module.target, compiled_dir
-            )
-        } else {
-            exec(
-                "jar", "cfe", "${module.target}/${module.name}.jar",
-                main_class_fq,
-                "-C", module.target, compiled_dir
-            )
+        val compiled_dir = when {
+            src_target.isFile -> module.target
+            src_target.isDirectory -> Paths.get(module.target, module.src).toString()
+            else -> error("file is not file or directory $src_target")
+        }
+
+        val meta_inf = "META-INF/${module.name}.kotlin_module"
+        when (val main_class_fq = module.main_src()?.main_class_fq()) {
+            null -> exec("jar", "cf", "${module.target}/${module.name}.jar", "-C", compiled_dir, ".")
+            else -> exec("jar", "cfe", "${module.target}/${module.name}.jar", main_class_fq, "-C", compiled_dir, ".")
         }
         if (exit_code != 0) err("Failed to release ${module.name}.jar")
         info("Released ${module.name}.jar ${stop(start_time)}")
@@ -216,7 +214,7 @@ class Nob(val opts: Opts) {
 
     fun exec(vararg cmd: String) {
         if (opts.verbose) info(cmd.joinToString(" "))
-        // info(cmd.joinToString(" "))
+        info(cmd.joinToString(" "))
         exit_code = java.lang.ProcessBuilder(*cmd).inheritIO().start().waitFor()
     }
 
@@ -244,7 +242,7 @@ class Nob(val opts: Opts) {
             add(src.absolutePath)
         }
         if (opts.verbose) info("kotlinc ${args.joinToString(" ")}")
-        // info("kotlinc ${args.joinToString(" ")}")
+        info("kotlinc ${args.joinToString(" ")}")
         val client_alive_file = target.resolve(".alive").toFile().apply { if (!exists()) createNewFile() }
         val daemon_reports = arrayListOf<DaemonReportMessage>()
         val compiler_id = Files.list(kotlin_home).filter { it.toString().endsWith(".jar") }.map { it.toFile() }.toList()
@@ -379,6 +377,7 @@ data class Lib(
     val jar_file get() = File("${jar_cache_dir}/${group_id}/${artifact_id}-${version}.jar").also { it.parentFile.mkdirs() }
     val pom_file get() = File("${jar_cache_dir}/${group_id}/${artifact_id}-${version}.pom").also { it.parentFile.mkdirs() }
     val module_file get() = File("${jar_cache_dir}/${group_id}/${artifact_id}-${version}.module").also { it.parentFile.mkdirs() }
+    val is_local get() = repo == "local"
     override fun toString() = "$group_id:$artifact_id:$version"
     override fun hashCode(): Int = "${toString()}:$scope".hashCode()
     override fun equals(other: Any?): Boolean {
@@ -388,6 +387,7 @@ data class Lib(
     }
     companion object {
         fun of(str: String) = str.split(':').let { Lib(it[0], it[1], it[2], it.getOrElse(3) { "compile" }) } 
+        fun local(str: String) = Lib("", str, "", repo = "local", jar_path = Paths.get(System.getProperty("user.dir"), str))
     }
 }
 
@@ -432,8 +432,10 @@ private fun solve_libs(opts: Opts, module: Module): List<Lib> {
             if (key !in keys) {
                 resolved.add(ResolvedLib(lib, "local"))
                 keys.add(key)
-                queue.add(lib)
-                download_jar(lib)
+                if (lib.repo != "local") {
+                    queue.add(lib)
+                    download_jar(lib)
+                }
             }
         }
         while(queue.isNotEmpty()) {
@@ -489,22 +491,36 @@ private fun read_cache(file: File, resolved: MutableList<ResolvedLib>) {
     file.readLines()
         .mapNotNull { line -> 
             val parts = line.split(":")
-            if (parts.size != 6) null
-            // restore jar_path for local libs
-            when (val jar_path = parts.getOrNull(6)) {
-                null -> ResolvedLib(resolved_from = parts[5], lib = Lib(parts[0], parts[1], parts[2], parts[3], parts[4]))
-                else -> ResolvedLib(resolved_from = parts[5], lib = Lib(parts[0], parts[1], parts[2], parts[3], parts[4], jar_path = Paths.get(jar_path)))
+            val repo = parts.getOrNull(6)
+            val jar_path = parts.getOrNull(7)?.let(Paths::get)
+            val lib = if (repo != null && jar_path !=  null) {
+                Lib(
+                    group_id = parts[0],
+                    artifact_id = parts[1],
+                    version = parts[2],
+                    scope = parts[3],
+                    type = parts[4],
+                    repo = repo,
+                    jar_path = jar_path,
+                )
+            } else {
+                Lib(
+                    group_id = parts[0],
+                    artifact_id = parts[1],
+                    version = parts[2],
+                    scope = parts[3],
+                    type = parts[4]
+                )
             }
+            ResolvedLib(lib = lib, resolved_from = parts[5])
         }.forEach(resolved::add)
 }
 
 private fun save_cache(file: File, resolved: List<ResolvedLib>) {
     file.writeText(resolved.joinToString("\n") {
-        // save jar_path for local libs
-        if (it.lib.jar_path.parent.parent.fileName.toString() != ".nob_cache") {
-            "${it.lib}:${it.lib.scope}:${it.lib.type}:${it.resolved_from}:${it.lib.jar_path.toAbsolutePath().normalize().toString()}"
-        } else {
-            "${it.lib}:${it.lib.scope}:${it.lib.type}:${it.resolved_from}"
+        when (it.lib.is_local) {
+            true  -> "${it.lib}:${it.lib.scope}:${it.lib.type}:${it.resolved_from}:${it.lib.repo}:${it.lib.jar_path.toAbsolutePath().normalize().toString()}" 
+            false -> "${it.lib}:${it.lib.scope}:${it.lib.type}:${it.resolved_from}"
         }
     })
 }
