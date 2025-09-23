@@ -27,7 +27,6 @@ fun main(args: Array<String>) {
         name = "test"
         src = "test.kt"
         libs = listOf(
-            Lib.of("org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.10.2"),
             Lib.local("klib.jar"),
         )
     }
