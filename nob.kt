@@ -52,7 +52,7 @@ class Nob(val opts: Opts) {
     var compiled = mutableSetOf<Module>()
 
     fun module(block: Module.() -> Unit): Module {
-        val module = Module().apply(block)
+        val module = Module(opts).apply(block)
         module.libs = resolve_libs(opts, module)
         mods.add(module)
         return module
@@ -325,9 +325,10 @@ fun List<Path>.into_cp(): String = joinToString(File.pathSeparator) { it.toAbsol
 fun path(str: String): Path = Paths.get(System.getProperty("user.dir"), str).also { it.toFile().mkdirs() }
 
 data class Module(
+    private val opts: Opts,
     var name: String = "app",
     var src: String = "src",
-    var res: String = "res",
+    var res: String = "",
     var target: String = "out",
     var libs: List<Lib> = emptyList(), 
     var mods: List<Module> = emptyList(),
@@ -354,7 +355,8 @@ data class Module(
         val res = path(res).toAbsolutePath().normalize().toString()
         val target = path(target).toAbsolutePath().normalize().toString() 
         val src_target = src_target().toAbsolutePath().normalize().toString()
-        return listOf(libs, mods, res, target, src_target).filter { it.isNotBlank() }.joinToString(File.pathSeparator)
+        val stdlib = opts.kotlin_home.resolve("kotlin-stdlib.jar").toAbsolutePath().normalize().toString()
+        return listOf(libs, mods, res, target, src_target, stdlib).filter { it.isNotBlank() }.joinToString(File.pathSeparator)
     }
 
     fun main_srcs(): Sequence<Path> = Files.walk(path(src)).asSequence().filter { Files.isRegularFile(it) && it.toFile().readText().contains("fun main(") }
