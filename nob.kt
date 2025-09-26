@@ -9,15 +9,16 @@ import org.jetbrains.kotlin.daemon.client.*
 import org.jetbrains.kotlin.daemon.common.*
 import org.w3c.dom.*
 
-const val DEBUG = false
+const val DEBUG = true
 
 fun main(args: Array<String>) {
+    val start_time = System.nanoTime()
     val nob = Nob.new(args)
 
     val example = nob.module {
         name = "example"
         src = "example"
-        libs = listOf(
+        libs = setOf(
             Lib.of("io.ktor:ktor-server-netty:3.2.2"),
             Lib.of("org.slf4j:slf4j-simple:2.0.17"),
         )
@@ -27,7 +28,7 @@ fun main(args: Array<String>) {
         name = "test"
         src = "test.kt"
         res = "res"
-        libs = listOf(
+        libs = setOf(
             Lib.local("klib.jar"),
         )
     }
@@ -44,12 +45,13 @@ fun main(args: Array<String>) {
         else -> nob.mods.filter { it.name != "nob" }.forEach { nob.compile(it) }
     }
 
+    info("Completed in ${stop(start_time)}")
     nob.exit()
 }
 
 class Nob(val opts: Opts) {
     private var exit_code = 0
-    var mods = mutableListOf<Module>()
+    var mods = mutableSetOf<Module>()
     var compiled = mutableSetOf<Module>()
 
     companion object {
@@ -87,9 +89,9 @@ class Nob(val opts: Opts) {
         exit(0)
     }
 
-    fun compile(module: Module) {
+    fun compile(module: Module): Boolean {
         val start_time = System.nanoTime()
-        if (module in compiled) return
+        if (module in compiled) return false
         module.mods.forEach { compile(it) }
 
         val src = path(module.src).toFile()
@@ -106,15 +108,13 @@ class Nob(val opts: Opts) {
         }
 
         compiled.add(module)
+        if (!has_changes) return false
 
-        if (has_changes) {
-            val classpath = module.compile_cp()
-            if (src.isFile && src.name == "nob.kt") target = Paths.get(module.target).toAbsolutePath().normalize() 
-            compile_with_daemon(src, target, classpath, module.name)
-            info("Compiled ${module.name} ${stop(start_time)}")
-        } else {
-            info("${module.name} is up to date ${stop(start_time)}")
-        }
+        val classpath = module.compile_cp()
+        if (src.isFile && src.name == "nob.kt") target = Paths.get(module.target).toAbsolutePath().normalize() 
+        compile_with_daemon(src, target, classpath, module.name)
+        info("Compiled ${module.name} ${stop(start_time)}")
+        return true
     }
 
     fun run(module: Module, main_class_fq: String, run_args: Array<String>) {
@@ -148,7 +148,7 @@ class Nob(val opts: Opts) {
             else -> exec("jar", "cfe", "${module.target}/${module.name}.jar", main_class_fq, "-C", compiled_dir, ".")
         }
         if (exit_code != 0) err("Failed to release ${module.name}.jar")
-        info("Released ${module.name}.jar ${stop(start_time)}")
+        // info("Released ${module.name}.jar ${stop(start_time)}")
     }
 
     fun release_fat(module: Module) {
@@ -191,7 +191,7 @@ class Nob(val opts: Opts) {
                 }
             }
         }
-        info("Released ${module.name}-fat.jar ${stop(start_time)}")
+        // info("Released ${module.name}-fat.jar ${stop(start_time)}")
     }
 
     fun exec(quiet: Boolean, vararg cmd: String) {
@@ -281,14 +281,10 @@ class Nob(val opts: Opts) {
     }
 
     private fun rebuild_urself(module: Module, args: Array<String>) {
-        val src = Paths.get(module.src)
-        val classfile = Paths.get("out/nob/nobKt.class")
-        if (!classfile.toFile().exists() || Files.getLastModifiedTime(src).toMillis() > Files.getLastModifiedTime(classfile).toMillis()) {
-            compile(module) // if we return if it was cached or compiled, we dont need the above code
+        if (compile(module)) {
             if (exit_code != 0) exit() 
-            // we dont need to wait for this process, because this one should replace the current process
             java.lang.ProcessBuilder("java", "-cp", "${System.getProperty("java.class.path")}", "nob.NobKt", *args).inheritIO().start() 
-            exit(0) // terminate this process because the new one is taking over
+            exit(0)
         }
     }
 
@@ -331,8 +327,8 @@ data class Module(
     var src: String = "",
     var res: String = "",
     var target: String = "out",
-    var libs: List<Lib> = emptyList(), 
-    var mods: List<Module> = emptyList(),
+    var libs: Set<Lib> = emptySet(), 
+    var mods: Set<Module> = emptySet(),
 ) {
     fun src_target(): Path { 
         val src_target = Paths.get(src).toFile()
@@ -426,12 +422,12 @@ private fun find_decending_libs(module: Module, seen: MutableSet<Lib>) {
     module.mods.forEach { mod -> find_decending_libs(mod, seen) }
 }
 
-private fun resolve_libs(opts: Opts, module: Module): List<Lib> {
+private fun resolve_libs(opts: Opts, module: Module): Set<Lib> {
     val start_time = System.nanoTime()
 
     // one cache file per root node module
     val cache_file = path(module.target).resolve("${module.name}-libs.cache").toFile()
-    val resolved = mutableListOf<ResolvedLib>()
+    val resolved = mutableSetOf<ResolvedLib>()
     read_cache(cache_file, resolved)
 
     val keys = resolved.map { LibKey(it.lib.group_id, it.lib.artifact_id) }.toMutableSet()
@@ -471,16 +467,15 @@ private fun resolve_libs(opts: Opts, module: Module): List<Lib> {
                     }
                 }
         }
-        info("resolve_kotlin_libs")
         return resolved.resolve_kotlin_libs(opts).also {
             save_cache(cache_file, it)
             info("Resolved ${resolved.size} libs ${stop(start_time)}")
-        }.map { it.lib }
+        }.map { it.lib }.toSet()
     }
-    return resolved.map { it.lib }
+    return resolved.map { it.lib }.toSet()
 }
 
-private fun List<ResolvedLib>.resolve_kotlin_libs(opts: Opts): List<ResolvedLib> {
+private fun Set<ResolvedLib>.resolve_kotlin_libs(opts: Opts): Set<ResolvedLib> {
     return this.map { resolved -> 
         val lib = resolved.lib
         when (lib.group_id) {
@@ -488,7 +483,7 @@ private fun List<ResolvedLib>.resolve_kotlin_libs(opts: Opts): List<ResolvedLib>
                 val local = opts.kotlin_home.resolve("${lib.artifact_id}.jar")
                 when (local.toFile().exists()) {
                     true -> {
-                        info("found local kotlin substitute: $local")
+                        // info("found local kotlin substitute: $local")
                         ResolvedLib(lib.copy(version = opts.kotlin_version, jar_path = local, repo = "local"), resolved.resolved_from)
                     }
                     false -> {
@@ -499,10 +494,10 @@ private fun List<ResolvedLib>.resolve_kotlin_libs(opts: Opts): List<ResolvedLib>
             }
             else -> resolved
         }
-    }
+    }.toSet()
 }
 
-private fun read_cache(file: File, resolved: MutableList<ResolvedLib>) {
+private fun read_cache(file: File, resolved: MutableSet<ResolvedLib>) {
     if (!file.exists()) return
     file.readLines()
         .mapNotNull { line -> 
@@ -532,7 +527,7 @@ private fun read_cache(file: File, resolved: MutableList<ResolvedLib>) {
         }.forEach(resolved::add)
 }
 
-private fun save_cache(file: File, resolved: List<ResolvedLib>) {
+private fun save_cache(file: File, resolved: Set<ResolvedLib>) {
     file.writeText(resolved.joinToString("\n") {
         when (it.lib.is_local) {
             true  -> "${it.lib}:${it.lib.scope}:${it.lib.type}:${it.resolved_from}:${it.lib.repo}:${it.lib.jar_path.toAbsolutePath().normalize().toString()}" 
@@ -542,6 +537,8 @@ private fun save_cache(file: File, resolved: List<ResolvedLib>) {
 }
 
 class GradleResolver {
+    private val parsed_module_cache: MutableMap<Lib, Map<*, *>?> = mutableMapOf()
+
     fun solve_deps(lib: Lib): Set<ResolvedLib> {
         val module = download_module(lib) ?: return emptySet()
         val component = module["component"] as Map<*, *>
@@ -607,7 +604,11 @@ class GradleResolver {
     }
 
     private fun download_module(lib: Lib): Map<*, *>? {
-        return try {
+        if (lib in parsed_module_cache) {
+            debug("download ${lib.module_url} ${color("[CACHE]", Color.cyan)}")
+            return parsed_module_cache[lib]
+        }
+        val result = try {
             val text = if (lib.module_file.exists()) {
                 lib.module_file.readText()
                     .also { debug("download ${lib.module_url} ${color("[CACHE]", Color.yellow)}") }
@@ -625,6 +626,8 @@ class GradleResolver {
             err("download ${lib.module_url} ${color("[FAIL]", Color.red)} ${e.message}")
             null
         }
+        parsed_module_cache[lib] = result
+        return result
     }
 }
 
@@ -635,7 +638,7 @@ class MavenResolver {
     private val boms_cache = mutableMapOf<Lib, Set<Lib>>()
 
     fun solve_deps(lib: Lib): Set<ResolvedLib> {
-        val pom = download_pom(lib) ?: return emptySet()
+        val pom = get_doc(lib) ?: return emptySet()
         val project = pom.getElementsByTagName("project").item(0) as Element
         val dependencies_node = project.get_direct_child("dependencies") ?: return emptySet()
         val dependencies = dependencies_node.getElementsByTagName("dependency")

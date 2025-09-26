@@ -18,3 +18,5 @@ if [ ! -f out/nob/NobKt.class ]; then
 fi
 
 java -cp "out:$LIBS" nob.NobKt $@
+# java -XX:StartFlightRecording=duration=60s,filename=rec.jfr -cp "out:$LIBS" nob.NobKt $@
+
