@@ -15,7 +15,7 @@ class ModuleTest {
 
     @Test
     fun `compile classpath - add lib`() {
-        val module = Module(opts, libs = listOf(Lib.of("a:b:c")))
+        val module = Module(opts, libs = setOf(Lib.of("a:b:c")))
         val target = Paths.get(System.getProperty("user.dir"), "out")
         val lib = Paths.get(System.getProperty("user.home"), ".nob_cache", "a", "b-c.jar")
         eq("$lib:$target", module.compile_cp())
@@ -30,7 +30,7 @@ class ModuleTest {
 
     @Test
     fun `compile classpath - add mod`() {
-        val module = Module(opts, mods = listOf(Module(opts, src = "out")))
+        val module = Module(opts, mods = setOf(Module(opts, src = "out")))
         val target = Paths.get(System.getProperty("user.dir"), "out")
         val mods = Paths.get(System.getProperty("user.dir"), "out", "out") // target/src = out/out
         eq("$mods:$target", module.compile_cp())
@@ -41,8 +41,8 @@ class ModuleTest {
         val module = Module(
             opts,
             target = "out/custom",
-            libs = listOf(Lib.of("a:b:c")),
-            mods = listOf(Module(opts, src = "out")),
+            libs = setOf(Lib.of("a:b:c")),
+            mods = setOf(Module(opts, src = "out")),
         )
         val libs = Paths.get(System.getProperty("user.home"), ".nob_cache", "a", "b-c.jar")
         val mods = Paths.get(System.getProperty("user.dir"), "out", "out") // target/src = out/out
@@ -63,7 +63,7 @@ class ModuleTest {
 
     @Test
     fun `runtime classpath - add lib`() {
-        val module = Module(opts, src = "nob", libs = listOf(Lib.of("a:b:c")))
+        val module = Module(opts, src = "nob", libs = setOf(Lib.of("a:b:c")))
         val lib = Paths.get(System.getProperty("user.home"), ".nob_cache", "a", "b-c.jar")
         val target = Paths.get(System.getProperty("user.dir"), "out")
         val src_target = java.nio.file.Paths.get(System.getProperty("user.dir"), "out")
@@ -84,7 +84,7 @@ class ModuleTest {
 
     @Test
     fun `runtime classpath - add mod`() {
-        val module = Module(opts, src = "nob", mods = listOf(Module(opts, src = "out")))
+        val module = Module(opts, src = "nob", mods = setOf(Module(opts, src = "out")))
         val mods = Paths.get(System.getProperty("user.dir"), "out", "out") // target/src = out/out
         val target = Paths.get(System.getProperty("user.dir"), "out")
         val src_target = Paths.get(System.getProperty("user.dir"), "out")
@@ -101,8 +101,8 @@ class ModuleTest {
             res = "res",
             src = "nob",
             target = "out/custom",
-            libs = listOf(Lib.of("a:b:c")),
-            mods = listOf(Module(opts, src = "out")),
+            libs = setOf(Lib.of("a:b:c")),
+            mods = setOf(Module(opts, src = "out")),
         )
         val libs = Paths.get(System.getProperty("user.home"), ".nob_cache", "a", "b-c.jar")
         val mods = Paths.get(System.getProperty("user.dir"), "out", "out") // target/src = out/out

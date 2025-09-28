@@ -28,7 +28,7 @@ fun main(args: Array<String>) {
 
     val test = nob.module {
         name = "test"
-        src = "test.kt"
+        src = "test"
         res = "res"
         libs = setOf(
             Lib.local("klib.jar"),
@@ -220,18 +220,18 @@ class Nob(val opts: Opts) {
         // info("Released ${module.name}-fat.jar ${stop(start_time)}")
     }
 
-    fun exec(quiet: Boolean, vararg cmd: String) {
-        if (quiet) {
-            if (opts.verbose) info(cmd.joinToString(" "))
-            exit_code = java.lang.ProcessBuilder(*cmd)
-                .redirectOutput(java.lang.ProcessBuilder.Redirect.DISCARD)
-                .redirectError(java.lang.ProcessBuilder.Redirect.DISCARD)
-                .start()
-                .waitFor()
-        } else {
-            exec(*cmd)
-        }
-    }
+    // fun exec(quiet: Boolean, vararg cmd: String) {
+    //     if (quiet) {
+    //         if (opts.verbose) info(cmd.joinToString(" "))
+    //         exit_code = java.lang.ProcessBuilder(*cmd)
+    //             .redirectOutput(java.lang.ProcessBuilder.Redirect.DISCARD)
+    //             .redirectError(java.lang.ProcessBuilder.Redirect.DISCARD)
+    //             .start()
+    //             .waitFor()
+    //     } else {
+    //         exec(*cmd)
+    //     }
+    // }
 
     fun exec(vararg cmd: String) {
         if (opts.verbose) info(cmd.joinToString(" "))
