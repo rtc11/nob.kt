@@ -36,7 +36,10 @@ fun main(args: Array<String>) {
     }
 
     when (val arg1 = args.getOrNull(0)) {
-        "run" -> nob.run(example, "MainKt", arrayOf())
+        "run" -> {
+            nob.compile(example)
+            nob.run(example, "MainKt", arrayOf())
+        }
         "test" -> {
             nob.compile(test)
             nob.run(test, "test.TesterKt", arrayOf("-f", test.src_target().toAbsolutePath().normalize().toString()))
@@ -135,7 +138,7 @@ class Nob(val opts: Opts) {
     }
 
     fun run(module: Module, main_class_fq: String, run_args: Array<String>) {
-        info("Running $main_class_fq")
+        // info("Running $main_class_fq")
         val cmd = buildList{
             add("java")
             add("-Dfile.encoding=UTF-8")
@@ -323,7 +326,7 @@ class Nob(val opts: Opts) {
 data class Opts(
     var jvm_version: Int = 21,
     var kotlin_version: String = "2.2.0",
-    var kotlin_home: Path = Paths.get(System.getenv("KOTLIN_HOME"), "libexec", "lib"),
+    var kotlin_home: Path = Paths.get(System.getenv("KOTLIN_LIB")),
     var backend_threads: Int = 0, // run codegen with N thread per processor (Default 1)
     var verbose: Boolean = false,
     var error: Boolean = true,

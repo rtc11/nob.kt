@@ -2,21 +2,19 @@
 
 set -e
 
-if [ -z "$KOTLIN_HOME" ]; then
-    echo "environment variable '$KOTLIN_HOME' is missing" 
+# kotlin-stdlib.jar kotlin-compiler.jar kotlin-daemon-client.jar kotlin-daemon.jar
+if [ -z "$KOTLIN_LIB" ]; then
+    echo "environment variable '$KOTLIN_LIB' is missing" 
     exit 1
 fi
-
-KOTLIN_LIB="$KOTLIN_HOME/libexec/lib"
-LIBS="$KOTLIN_LIB/kotlin-stdlib.jar:$KOTLIN_LIB/kotlin-compiler.jar:$KOTLIN_LIB/kotlin-daemon-client.jar:/$KOTLIN_LIB/kotlin-daemon.jar"
 
 mkdir -p out/nob
 
 if [ ! -f out/nob/NobKt.class ]; then
     echo "[INFO] bootstrapping nob.kt"
-    kotlinc nob.kt -cp "$LIBS" -d out
+    kotlinc nob.kt -cp "$KOTLIN_LIB/*" -d out
 fi
 
-java -cp "out:$LIBS" nob.NobKt $@
+java -cp "out:$KOTLIN_LIB/*" nob.NobKt $@
 # java -XX:StartFlightRecording=duration=60s,filename=rec.jfr -cp "out:$LIBS" nob.NobKt $@
 
