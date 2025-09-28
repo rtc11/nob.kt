@@ -4,12 +4,14 @@ import java.io.*
 import java.nio.file.*
 import java.util.*
 import java.util.jar.*
+import kotlin.io.path.name
 import kotlin.streams.asSequence
 import org.jetbrains.kotlin.daemon.client.*
 import org.jetbrains.kotlin.daemon.common.*
 import org.w3c.dom.*
 
-const val DEBUG = true
+const val DEBUG = false
+const val INFO = true
 
 fun main(args: Array<String>) {
     val start_time = System.nanoTime()
@@ -33,15 +35,30 @@ fun main(args: Array<String>) {
         )
     }
 
-    when {
-        args.getOrNull(0) == "run" -> nob.run(example, "MainKt", arrayOf())
-        args.getOrNull(0) == "test" -> {
+    when (val arg1 = args.getOrNull(0)) {
+        "run" -> nob.run(example, "MainKt", arrayOf())
+        "test" -> {
             nob.compile(test)
             nob.run(test, "test.TesterKt", arrayOf("-f", test.src_target().toAbsolutePath().normalize().toString()))
         }
-        args.getOrNull(0) == "release" -> nob.release(example)
-        args.getOrNull(0) == "example" -> nob.compile(example)
-        args.getOrNull(0) == "rebuild" -> {}
+        "release" -> {
+            when (val arg2 = args.getOrNull(1)) {
+                "example" -> {
+                    nob.compile(example)
+                    nob.release(example)
+                }
+                "nob" -> {
+                    nob.release(nob.mods.single { it.name == "nob" })
+                }
+            }
+        }
+        "example" -> nob.compile(example)
+        "classpath" -> {
+            when (val arg2 = args.getOrNull(1)) {
+                "runtime" -> println(example.runtime_cp().replace(':', '\n'))
+            }
+            nob.exit()
+        }
         else -> nob.mods.filter { it.name != "nob" }.forEach { nob.compile(it) }
     }
 
@@ -142,13 +159,19 @@ class Nob(val opts: Opts) {
             else -> error("file is not file or directory $src_target")
         }
 
+        val runtime_libs = path(compiled_dir).resolve("runtime-libs").also { it.toFile().mkdirs() }
+        module.runtime_cp().split(':').map { Path.of(it) }.filter { it.name.substringAfterLast('.') == "jar" }.forEach { 
+            exec("cp", it.toString(), runtime_libs.resolve(it.name).toString())
+            // exec("ln", "-sf", it.toString(), runtime_libs.resolve(it.name).toString()) // docker does not follow symlink when copying
+        }
+
         val meta_inf = "META-INF/${module.name}.kotlin_module"
         when (val main_class_fq = module.main_src()?.main_class_fq()) {
             null -> exec("jar", "cf", "${module.target}/${module.name}.jar", "-C", compiled_dir, ".")
             else -> exec("jar", "cfe", "${module.target}/${module.name}.jar", main_class_fq, "-C", compiled_dir, ".")
         }
         if (exit_code != 0) err("Failed to release ${module.name}.jar")
-        // info("Released ${module.name}.jar ${stop(start_time)}")
+        info("Released ${module.name}.jar ${stop(start_time)}")
     }
 
     fun release_fat(module: Module) {
@@ -885,7 +908,7 @@ fun Element.get_direct_child(tag_name: String): Element? {
 }
 
 fun debug(msg: String) { if (DEBUG) println("${color("[DEBUG]", Color.yellow)} $msg") }
-fun info(msg: String) { println("${color("[INFO]", Color.cyan)} $msg") }
+fun info(msg: String) { if (INFO) println("${color("[INFO]", Color.cyan)} $msg") }
 fun warn(msg: String) { println("${color("[WARN]", Color.magenta)} $msg") }
 fun err(msg: String) { println("${color("[ERR]", Color.red)} $msg") }
 
