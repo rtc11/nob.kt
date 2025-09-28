@@ -19,6 +19,17 @@ jobs:
         with:
           java-version: 21
           distribution: temurin
+      - name: Inspect Kotlin installation
+        run: |
+          echo "Kotlnc location:"
+          which kotlinc
+          echo "Contents of /usr/share/kotlinc:"
+          ls -R /usr/share/kotlinc || echo "No such directory"
+          echo "Search for kotlin jars:"
+          find /usr -type f -name "kotlin-*.jar" 2>/dev/null || echo "None found"
+          echo "List root tool cache:"
+          ls -R /usr/share || echo "No /usr/share listing"
+
       - run: ./nob test
         env: 
           KOTLIN_LIB: /usr/share/kotlinc/lib/
