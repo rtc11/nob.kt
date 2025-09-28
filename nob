@@ -12,7 +12,7 @@ mkdir -p out/nob
 
 if [ ! -f out/nob/NobKt.class ]; then
     echo "[INFO] bootstrapping nob.kt"
-    kotlinc nob.kt -cp "$KOTLIN_LIB/*" -d out
+    kotlinc nob.kt -cp "$KOTLIN_LIB/kotlin-stdlib.jar:$KOTLIN_LIB/kotlin-compiler.jar$KOTLIN_LIB/kotlin-daemon.jar$KOTLIN_LIB/kotlin-daemon-client.jar:::" -d out
 fi
 
 java -cp "out:$KOTLIN_LIB/*" nob.NobKt $@
