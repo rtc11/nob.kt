@@ -28,6 +28,9 @@ jobs:
             out/nob/
           key: nob-${{ hashFiles('nob.kt') }}
           restore-keys: nob-
+      - name: HACK - Update file timestamps after cache restore
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: find out/nob/ -type f -exec touch -m {} +
       - run: ./nob test
       - run: ./nob run
       - run: ./nob release example
