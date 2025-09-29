@@ -25,7 +25,9 @@ jobs:
         with:
           path: |
             /home/runner/.nob_cache/
-          key: nob.kt
+            out/nob/
+          key: nob-${{ hashFiles('nob.kt') }}
+          restore-keys: nob-
       - run: ./nob test
       - run: ./nob run
       - run: ./nob release example
