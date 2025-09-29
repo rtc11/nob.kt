@@ -26,6 +26,7 @@ jobs:
           path: |
             out/nob/
             out/example-libs.cache
+            .nob_cache
             out/example/runtime-libs
           key: nob.kt
       - run: ./nob test
