@@ -21,6 +21,13 @@ jobs:
         with:
           java-version: 21
           distribution: temurin
+      - uses: actions/cache@v4
+        with:
+          path: |
+            out/nob/
+            out/example-libs.cache
+            out/example/runtime-libs
+          key: nob.kt
       - run: ./nob test
       - run: ./nob run
       - run: ./nob release example
