@@ -1,16 +1,16 @@
-&lt;svg width="600" height="80" viewBox="0 0 600 80" xmlns="http://www.w3.org/2000/svg"&gt;
-    &lt;rect width="600" height="80" fill="#111827" rx="8"/&gt;
-    &lt;style&gt;
+<svg width="600" height="80" viewBox="0 0 600 80" xmlns="http://www.w3.org/2000/svg">
+    <rect width="600" height="80" fill="#111827" rx="8"/>
+    <style>
         .retro-text { 
             font-family: monospace; 
             text-shadow: 0 0 5px rgba(6, 182, 212, 0.8), 0 0 10px rgba(6, 182, 212, 0.5); 
         }
-    &lt;/style&gt;
-    &lt;text x="300" y="55" class="retro-text" font-size="56" fill="#06b6d4" text-anchor="middle" font-weight="bold" letter-spacing="4"&gt;
+    </style>
+    <text x="300" y="55" class="retro-text" font-size="56" fill="#06b6d4" text-anchor="middle" font-weight="bold" letter-spacing="4">
         nob.kt
-    &lt;/text&gt;
-    &lt;rect x="420" y="28" width="10" height="28" fill="#facc15" rx="2" opacity="0.7"/&gt;
-&lt;/svg&gt;
+    </text>
+    <rect x="420" y="28" width="10" height="28" fill="#facc15" rx="2" opacity="0.7"/>
+</svg>
 
 # nob.kt - NoBuild for Kotlin
 This is inspired by the header only library version for C [https://github.com/tsoding/nob.h](https://github.com/tsoding/nob.h)
