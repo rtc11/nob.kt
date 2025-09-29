@@ -28,6 +28,8 @@ jobs:
           path: |
             /home/runner/.nob_cache/
             out/nob/
+            out/example-libs.cache
+            out/test-libs.cache
           key: nob-${{ hashFiles('nob.kt') }}
           restore-keys: nob-
       - name: HACK - Update file timestamps after cache restore
