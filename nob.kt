@@ -11,7 +11,7 @@ import org.jetbrains.kotlin.daemon.common.*
 import org.w3c.dom.*
 
 const val DEBUG = false
-const val INFO = true
+const val INFO = false
 
 fun main(args: Array<String>) {
     val start_time = System.nanoTime()
@@ -36,13 +36,20 @@ fun main(args: Array<String>) {
     }
 
     when (val arg1 = args.getOrNull(0)) {
+        "debug" -> {
+            nob.compile(example)
+            nob.run(example, "MainKt", arrayOf())
+        }
         "run" -> {
             nob.compile(example)
             nob.run(example, "MainKt", arrayOf())
         }
         "test" -> {
             nob.compile(test)
-            nob.run(test, "test.TesterKt", arrayOf("-f", test.src_target().toAbsolutePath().normalize().toString()))
+            when (args.getOrNull(1)) {
+                null -> nob.run(test, "test.TesterKt", arrayOf("-f", test.src_target().toAbsolutePath().normalize().toString()))
+                else -> nob.run(test, "test.TesterKt", args.drop(1).toTypedArray())
+            }
         }
         "release" -> {
             when (val arg2 = args.getOrNull(1)) {
@@ -59,10 +66,11 @@ fun main(args: Array<String>) {
         "classpath" -> {
             when (val arg2 = args.getOrNull(1)) {
                 "runtime" -> println(example.runtime_cp().replace(':', '\n'))
+                "compile" -> println(example.runtime_cp().replace(':', '\n'))
             }
-            nob.exit()
+            println(example.runtime_cp().replace(':', '\n'))
         }
-        else -> nob.mods.filter { it.name != "nob" }.forEach { nob.compile(it) }
+        // else -> nob.mods.filter { it.name != "nob" }.forEach { nob.compile(it) }
     }
 
     info("Completed in ${stop(start_time)}")
@@ -77,15 +85,13 @@ class Nob(val opts: Opts) {
     companion object {
         fun new(args: Array<String>): Nob {
             var opts = Opts()
-            val arg = args.getOrNull(0)
-            if (arg == "debug") opts.debug = true
             val nob = Nob(opts)
             val module = nob.module {
                 name = "nob"
                 src = "nob.kt"
                 target = "out"
             }
-            if (arg == "clean") nob.clean()
+            if (args.getOrNull(0) == "clean") nob.clean()
             nob.rebuild_urself(module, args)
             return nob
         }
@@ -137,8 +143,7 @@ class Nob(val opts: Opts) {
         return true
     }
 
-    fun run(module: Module, main_class_fq: String, run_args: Array<String>) {
-        // info("Running $main_class_fq")
+    fun run(module: Module, main_class_fq: String, run_args: Array<String> = arrayOf()) {
         val cmd = buildList{
             add("java")
             add("-Dfile.encoding=UTF-8")

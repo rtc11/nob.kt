@@ -1,31 +1,42 @@
-![img](logo.png)
+<svg width="600" height="80" viewBox="0 0 600 80" xmlns="http://www.w3.org/2000/svg">
+    <rect width="600" height="80" fill="#111827" rx="8"/>
+    <style>
+        .retro-text { 
+            font-family: monospace; 
+            text-shadow: 0 0 5px rgba(6, 182, 212, 0.8), 0 0 10px rgba(6, 182, 212, 0.5); 
+        }
+    </style>
+    <text x="300" y="55" class="retro-text" font-size="56" fill="#06b6d4" text-anchor="middle" font-weight="bold" letter-spacing="4">
+        nob.kt
+    </text>
+    <rect x="420" y="28" width="10" height="28" fill="#facc15" rx="2" opacity="0.7"/>
+</svg>
 
 # nob.kt - NoBuild for Kotlin
 This is inspired by the header only library version for C [https://github.com/tsoding/nob.h](https://github.com/tsoding/nob.h)
 
-Build kotlin files only with kotlin.
+Build your Kotlin project with kotlin.
 
 # Features
 - Builds itself automatically
 - Uses a kotlin daemon for faster compilation
-- Resolves maven/gradle dependencies
+- Resolves maven and gradle dependencies
+- Supports your own test runner and junit
 
 # Setup
 - clone `nob` and `nob.kt` into your project.
-- ensure `KOTLIN_HOME` is on your PATH.
+- ensure `KOTLIN_LIB` is on your PATH pointing to the kotlinc/lib with kotlin-stdlib.jar, kotlin-compiler.jar, etc
 
 # Usage
-Bootstrap nob.kt by running `./nob`
+Bootstrap nob.kt
+> ./nob
 
-Compile your project by running `./nob`
-
-Change the `main` to include your set of libraries, 
-it should be possible to select a local only library as well (not tested)
+Create your module(s) and a CLI for your usage:
 ```kotlin
 fun main(args: Array<String>) {
     val nob = Nob.new(args)
 
-    nob.module {
+    val example = nob.module {
         name = "example"
         src = "example"
         libs = listOf(
@@ -34,17 +45,15 @@ fun main(args: Array<String>) {
         )
     }
 
-    when {
-        nob.opts.debug -> nob.run(args)
-        args.getOrNull(0) == "run" -> nob.run(args)
-        args.getOrNull(0) == "test" -> nob.test(args)
-        args.getOrNull(0) == "release" -> {
-            when (val name = args.getOrNull(1)) {
-                null -> nob.modules.filter { it.name != "nob" }.forEach { nob.release(it) }
-                else -> nob.release(nob.modules.single { it.name == name })
-            }
+    nob.compile(example)
+
+    when(val arg = args.getOrNull(0)) {
+        "run" -> nob.run(example, "MainKt")
+        "release" -> nob.release(example)
+        "debug" -> {
+            nob.opts.debug = true
+            nob.run(example, "MainKt")
         }
-        else -> nob.compile(args)
     }
 
     nob.exit()
