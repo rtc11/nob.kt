@@ -24,10 +24,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: |
-            out/nob/
-            out/example-libs.cache
-            .nob_cache
-            out/example/runtime-libs
+            /home/runner/.nob_cache/
           key: nob.kt
       - run: ./nob test
       - run: ./nob run
