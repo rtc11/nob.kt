@@ -1,16 +1,16 @@
-<svg width="600" height="80" viewBox="0 0 600 80" xmlns="http://www.w3.org/2000/svg">
-    <rect width="600" height="80" fill="#111827" rx="8"/>
-    <style>
+&lt;svg width="600" height="80" viewBox="0 0 600 80" xmlns="http://www.w3.org/2000/svg"&gt;
+    &lt;rect width="600" height="80" fill="#111827" rx="8"/&gt;
+    &lt;style&gt;
         .retro-text { 
             font-family: monospace; 
             text-shadow: 0 0 5px rgba(6, 182, 212, 0.8), 0 0 10px rgba(6, 182, 212, 0.5); 
         }
-    </style>
-    <text x="300" y="55" class="retro-text" font-size="56" fill="#06b6d4" text-anchor="middle" font-weight="bold" letter-spacing="4">
+    &lt;/style&gt;
+    &lt;text x="300" y="55" class="retro-text" font-size="56" fill="#06b6d4" text-anchor="middle" font-weight="bold" letter-spacing="4"&gt;
         nob.kt
-    </text>
-    <rect x="420" y="28" width="10" height="28" fill="#facc15" rx="2" opacity="0.7"/>
-</svg>
+    &lt;/text&gt;
+    &lt;rect x="420" y="28" width="10" height="28" fill="#facc15" rx="2" opacity="0.7"/&gt;
+&lt;/svg&gt;
 
 # nob.kt - NoBuild for Kotlin
 This is inspired by the header only library version for C [https://github.com/tsoding/nob.h](https://github.com/tsoding/nob.h)
@@ -66,11 +66,7 @@ Start debug mode:
 Attach debugger:
 > jdb -attach 5005
 
-Run tests (nb, this is looking for a main() on your classpath, specify it explicit in `Opts` if necessary):
-> ./nob test <test runner args>
-
 ## Example
-From clean state, this illustrate compile times, release times and dependency resolution
 ![img](example.png)
 
 Tune `Opts` with your preferences: 
@@ -78,6 +74,7 @@ Tune `Opts` with your preferences:
 data class Opts(
     var jvm_version: Int = 21,
     var kotlin_version: String = "2.2.0",
+    var kotlin_home: Path = Paths.get(System.getenv("KOTLIN_LIB")),
     var backend_threads: Int = 0, // run codegen with N thread per processor (Default 1)
     var verbose: Boolean = false,
     var error: Boolean = true,
